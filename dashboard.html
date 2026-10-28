@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en" data-default-lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GPU 모니터</title>
+<title>GPU Monitor</title>
 <link rel="icon" id="favicon" href="data:,">
 <style>
 /* Grafana/Netdata 관례를 따른다: 지표 하나에 패널 하나, 머신은 그 안의 계열.
@@ -201,27 +201,101 @@ dl.kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums;
 <body>
 
 <header>
-  <h1>GPU 모니터</h1>
+  <h1 id="title">GPU Monitor</h1>
   <span id="chips" style="display:flex;gap:6px;flex-wrap:wrap"></span>
   <span class="spacer"></span>
   <span class="seg" id="range"></span>
   <span class="conn" id="conn" hidden><span class="dot"></span><span id="connText"></span></span>
-  <button class="ghost" id="theme">테마</button>
+  <button class="ghost" id="theme">Theme</button>
+  <button class="ghost" id="lang">한국어</button>
 </header>
 
 <div id="alerts"><div class="abar calm"><span class="msg">&nbsp;</span></div></div>
 <main id="panels"></main>
-<div id="empty" hidden>아직 아무 에이전트도 보고하지 않았다.</div>
+<div id="empty" hidden></div>
 <div class="tip" id="tip" hidden></div>
 
 <script>
+// =====================================================================
+// 언어 — 기본은 hub 의 MONITOR_LANG(hub 가 <html data-default-lang> 에 채운다).
+// 보는 사람이 머리말 버튼으로 바꾸면 이 브라우저에 기억한다. ?lang=ko 로도 고른다.
+// 에이전트가 만든 문구(빈 GPU 사유·AI 작업 설명)는 그 에이전트의 언어로 온다.
+// =====================================================================
+const I18N = {
+  en: {
+    title: "GPU Monitor", theme: "Theme", other: "한국어", empty: "No agent has reported yet.",
+    u_s: "s", u_m: "m", u_h: "h", u_d: "d", justNow: "just now", ago: (d) => `${d} ago`, now: "now",
+    m_gu: "GPU utilization", m_gv: "VRAM", m_gt: "GPU temperature",
+    m_cu: "CPU utilization", m_ru: "RAM", m_ct: "CPU temperature",
+    etaNone: "ETA —", ends: (c) => `ends ${c}`, allBy: (c) => ` · all done ${c}`,
+    lossAria: (a, b) => `loss curve from ${a} to ${b}`,
+    offline: (a) => `offline · ${a}`, available: "available", inUse: "in use", aiChecking: " · AI identifying…",
+    restStages: "Remaining: ", next: "Next: ", basis: "Estimate: ",
+    st: { off: "offline", train: "training", stall: "training stalled", work: "working",
+          wstall: "work stalled", pause: "paused", busy: "in use", unknown: "in use (unknown)", free: "free" },
+    more: (n) => ` +${n} more`, planned: " (planned)",
+    pausedFor: (d) => `paused · ${d}`, stalledFor: (d) => `stalled · no change for ${d}`,
+    power: "Power", clock: "Clock", fan: "Fan", cores: (n) => `${n} cores`, disk: (p) => `Disk ${p}`,
+    diskFree: (b) => `${b} free`, uptime: "Uptime", host: "Host", ai: "AI",
+    identified: (a) => ` · identified ${a}`, log: "Log: ",
+    machines: (n) => `${n} machine${n === 1 ? "" : "s"}`,
+    colMachine: "Machine", colWhat: "Doing now", colProg: "Progress · ETA",
+    aAi: (m) => `AI can't identify jobs · ${m}`, aOom: "OOM risk", aDriver: "can't read GPU metrics",
+    aThrottle: "throttling?", aSwap: (p) => `swap full + RAM ${p}`, aDiskLeft: (b) => `${b} left`,
+    aDiskUsed: "used", aStall: (n, d) => `${n} stalled · no change for ${d} (GPU still held)`,
+    aiOn: (m) => `on · ${m}`, aiOff: (m) => `off · ${m}`, aiCheck: "checking",
+    noAlerts: "No alerts", moreAlerts: (n) => `+${n} more`,
+    tabAlerts: (n) => `⚠ ${n} alert${n === 1 ? "" : "s"}`, tabFree: (f, n) => `${f}/${n} GPUs free`,
+    tabNoFree: "No free GPU", hold: "Selecting text · live updates paused",
+    connDown: "Lost the hub · reconnecting",
+  },
+  ko: {
+    title: "GPU 모니터", theme: "테마", other: "English", empty: "아직 보고한 에이전트가 없습니다.",
+    u_s: "초", u_m: "분", u_h: "시간", u_d: "일", justNow: "방금", ago: (d) => `${d} 전`, now: "지금",
+    m_gu: "GPU 사용률", m_gv: "VRAM", m_gt: "GPU 온도", m_cu: "CPU 사용률", m_ru: "RAM", m_ct: "CPU 온도",
+    etaNone: "종료 —", ends: (c) => `${c} 종료`, allBy: (c) => ` · 전체 ${c}`,
+    lossAria: (a, b) => `loss 곡선 ${a}에서 ${b}까지`,
+    offline: (a) => `오프라인 · ${a}`, available: "사용 가능", inUse: "점유", aiChecking: " · AI 확인 중…",
+    restStages: "남은 단계: ", next: "다음: ", basis: "추정 근거: ",
+    st: { off: "오프라인", train: "학습 중", stall: "학습 멈춤", work: "작업 중",
+          wstall: "작업 멈춤", pause: "일시정지", busy: "점유 중", unknown: "점유 중(불명)", free: "비어있음" },
+    more: (n) => ` 외 ${n}개`, planned: " (계획)",
+    pausedFor: (d) => `일시정지 · ${d}째`, stalledFor: (d) => `멈춤 · ${d}째 변화 없음`,
+    power: "전력", clock: "클럭", fan: "팬", cores: (n) => `${n}코어`, disk: (p) => `디스크 ${p}`,
+    diskFree: (b) => `${b} 남음`, uptime: "부팅 후", host: "호스트", ai: "AI 식별",
+    identified: (a) => ` · AI 식별 ${a}`, log: "로그: ",
+    machines: (n) => `머신 ${n}대`, colMachine: "머신", colWhat: "지금 하는 일", colProg: "진행 · 종료",
+    aAi: (m) => `AI 식별 안 됨 · ${m}`, aOom: "OOM 위험", aDriver: "GPU 지표를 읽지 못합니다",
+    aThrottle: "스로틀링 의심", aSwap: (p) => `스왑 고갈 + RAM ${p}`, aDiskLeft: (b) => `${b} 남음`,
+    aDiskUsed: "사용", aStall: (n, d) => `${n} 진행이 멈췄습니다 · ${d}째 변화 없음 (GPU는 계속 점유 중)`,
+    aiOn: (m) => `켜짐 · ${m}`, aiOff: (m) => `꺼짐 · ${m}`, aiCheck: "확인 중",
+    noAlerts: "경고 없음", moreAlerts: (n) => `외 ${n}건`,
+    tabAlerts: (n) => `⚠ 경고 ${n}건`, tabFree: (f, n) => `빈 GPU ${f}/${n}`,
+    tabNoFree: "빈 GPU 없음", hold: "글 선택 중 · 실시간 갱신 멈춤",
+    connDown: "hub 연결 끊김 · 재연결 중",
+  },
+};
+const LANG_KEY = "gpumon-lang";
+let LANG = (() => {
+  const ok = (v) => Object.prototype.hasOwnProperty.call(I18N, v || "");
+  const q = new URLSearchParams(location.search).get("lang");
+  if (ok(q)) return q;
+  try { const v = localStorage.getItem(LANG_KEY); if (ok(v)) return v; } catch (e) {}
+  const d = document.documentElement.dataset.defaultLang;
+  return ok(d) ? d : "en";
+})();
+const t = (k, ...a) => {
+  const d = I18N[LANG] || I18N.en, v = k in d ? d[k] : I18N.en[k];
+  return typeof v === "function" ? v(...a) : v;
+};
+
 // =====================================================================
 // 서식
 // =====================================================================
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const num = (v) => (typeof v === "number" && isFinite(v));
-const nf = (v, d = 0) => num(v) ? v.toLocaleString("ko-KR",
+const nf = (v, d = 0) => num(v) ? v.toLocaleString(LANG === "ko" ? "ko-KR" : "en-US",
   { minimumFractionDigits: d, maximumFractionDigits: d }) : "—";
 const pct = (v, d = 0) => num(v) ? nf(v, d) + "%" : "—";
 const bytes = (b) => { if (!num(b)) return "—";
@@ -231,11 +305,11 @@ const bytes = (b) => { if (!num(b)) return "—";
 const gb = (mb, d = 1) => num(mb) ? nf(mb / 1024, d) : "—";
 const kstep = (v) => !num(v) ? "—" : v >= 10000 ? nf(v / 1000, 1) + "k" : nf(v);
 const dur = (s) => { if (!num(s)) return "—";
-  if (s < 60) return Math.round(s) + "초";
-  if (s < 3600) return Math.floor(s / 60) + "분";
-  if (s < 86400) return Math.floor(s / 3600) + "시간 " + Math.floor((s % 3600) / 60) + "분";
-  return Math.floor(s / 86400) + "일 " + Math.floor((s % 86400) / 3600) + "시간"; };
-const ago = (s) => !num(s) ? "—" : s < 3 ? "방금" : dur(s) + " 전";
+  if (s < 60) return Math.round(s) + t("u_s");
+  if (s < 3600) return Math.floor(s / 60) + t("u_m");
+  if (s < 86400) return Math.floor(s / 3600) + t("u_h") + " " + Math.floor((s % 3600) / 60) + t("u_m");
+  return Math.floor(s / 86400) + t("u_d") + " " + Math.floor((s % 86400) / 3600) + t("u_h"); };
+const ago = (s) => !num(s) ? "—" : s < 3 ? t("justNow") : t("ago", dur(s));
 const autoNum = (v) => { if (!num(v)) return "—";
   const a = Math.abs(v);
   if (a !== 0 && (a < 1e-3 || a >= 1e6)) return v.toExponential(2);
@@ -261,7 +335,7 @@ function assignColors(machines) {
 // =====================================================================
 // 시계열 패널 — 지표 하나, 머신은 계열
 // =====================================================================
-const RANGES = [[60, "1분"], [300, "5분"], [600, "10분"]];
+const RANGES = [60, 300, 600];
 let rangeSec = 300;
 
 function plot(series, { lo, hi, width, fmt, unit = "", thresholds = [] }) {
@@ -302,8 +376,8 @@ function plot(series, { lo, hi, width, fmt, unit = "", thresholds = [] }) {
     ${grid}${thr}
     <line x1="${P.l}" x2="${W - P.r}" y1="${H - P.b}" y2="${H - P.b}" stroke="var(--axis)" stroke-width="1"/>
     ${paths}
-    <text class="axlab" x="${P.l}" y="${H - 4}">${esc(dur(rangeSec))} 전</text>
-    <text class="axlab" x="${W - P.r}" y="${H - 4}" text-anchor="end">지금</text>
+    <text class="axlab" x="${P.l}" y="${H - 4}">${esc(t("ago", dur(rangeSec)))}</text>
+    <text class="axlab" x="${W - P.r}" y="${H - 4}" text-anchor="end">${esc(t("now"))}</text>
     <g class="cross" hidden><line y1="${P.t}" y2="${H - P.b}" stroke="var(--axis)" stroke-width="1"/></g>
   </svg>`;
 }
@@ -358,20 +432,20 @@ function bindPlot(box, series, fmt, head) {
 const pf = (v) => nf(v, 0) + "%";
 const tf = (v) => nf(v, 0) + "℃";
 const METRICS = [
-  { key: "gu", title: "GPU 사용률", lo: 0, hi: 100, fmt: pf,
+  { key: "gu", lo: 0, hi: 100, fmt: pf,
     pick: (m) => (m.gpus || [])[0], hist: (h, i) => ((h.gpus || []).find((g) => g.i === i) || {}).u,
     cur: (m, g) => g && g.util_pct },
-  { key: "gv", title: "VRAM", lo: 0, hi: 100, fmt: pf, thresholds: [95],
+  { key: "gv", lo: 0, hi: 100, fmt: pf, thresholds: [95],
     hist: (h, i) => ((h.gpus || []).find((g) => g.i === i) || {}).v,
     cur: (m, g) => g && g.vram_pct, warn: [85, 95] },
-  { key: "gt", title: "GPU 온도", lo: 25, hi: 100, fmt: tf, thresholds: [90],
+  { key: "gt", lo: 25, hi: 100, fmt: tf, thresholds: [90],
     hist: (h, i) => ((h.gpus || []).find((g) => g.i === i) || {}).c,
     cur: (m, g) => g && g.temp_c, warn: [80, 90] },
-  { key: "cu", title: "CPU 사용률", lo: 0, hi: 100, fmt: pf,
+  { key: "cu", lo: 0, hi: 100, fmt: pf,
     hist: (h) => h.cpu_util, cur: (m) => m.cpu && m.cpu.util_pct },
-  { key: "ru", title: "RAM", lo: 0, hi: 100, fmt: pf, thresholds: [95],
+  { key: "ru", lo: 0, hi: 100, fmt: pf, thresholds: [95],
     hist: (h) => h.ram_pct, cur: (m) => m.memory && m.memory.pct, warn: [85, 95] },
-  { key: "ct", title: "CPU 온도", lo: 25, hi: 100, fmt: tf, thresholds: [90],
+  { key: "ct", lo: 25, hi: 100, fmt: tf, thresholds: [90],
     hist: (h) => h.cpu_temp, cur: (m) => m.cpu && m.cpu.temp_c, warn: [85, 90] },
 ];
 
@@ -399,7 +473,7 @@ function panelHtml(metric, series, i) {
     <b class="${metric.warn ? grade(s.cur, metric.warn[0], metric.warn[1]) : ""}">${
       esc(num(s.cur) ? metric.fmt(s.cur) : "—")}</b></span>`).join("");
   return `<section class="panel">
-    <div class="ptitle">${esc(metric.title)}<span class="range">${esc(dur(rangeSec))}</span></div>
+    <div class="ptitle">${esc(t("m_" + metric.key))}<span class="range">${esc(dur(rangeSec))}</span></div>
     <div class="plot" data-metric="${i}"></div>
     <div class="legend">${legend}</div>
   </section>`;
@@ -421,10 +495,10 @@ function clockAt(secFromNow) {
 // rest 가 있으면(체인으로 예약된 남은 단계의 AI 추정 합) 체인 전체 종료도 붙인다.
 // 조각마다 span 으로 감싸 폰 폭에서는 남은 시간을 접고 '전체'를 둘째 줄로 내린다.
 function etaHtml(eta, age, rest) {
-  if (!num(eta)) return "종료 —";
+  if (!num(eta)) return esc(t("etaNone"));
   const left = Math.max(0, eta - (num(age) ? age : 0));
-  return `<span>${esc(clockAt(left))} 종료</span><span class="eta-left"> (${esc(dur(left))})</span>`
-    + (num(rest) && rest > 0 ? `<span class="eta-all"> · 전체 ${esc(clockAt(left + rest))}</span>` : "");
+  return `<span>${esc(t("ends", clockAt(left)))}</span><span class="eta-left"> (${esc(dur(left))})</span>`
+    + (num(rest) && rest > 0 ? `<span class="eta-all">${esc(t("allBy", clockAt(left + rest)))}</span>` : "");
 }
 
 function lossPlot(lines, width) {
@@ -464,7 +538,7 @@ function lossPlot(lines, width) {
         fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`, at };
   });
   return { svg: `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
-       aria-label="loss 곡선 ${autoNum(dMax)}에서 ${autoNum(dMin)}까지">
+       aria-label="${esc(t("lossAria", autoNum(dMax), autoNum(dMin)))}">
     <text class="axlab" x="0" y="${P.t - 2}">loss</text>
     ${grid}
     <line x1="${P.l}" x2="${W - P.r}" y1="${H - P.b}" y2="${H - P.b}" stroke="var(--axis)" stroke-width="1"/>
@@ -514,8 +588,8 @@ function machineTable(machines) {
     const aiOf = (gpu) => gpu && gpu.ai && gpu.ai.status === "done" ? gpu.ai : null;
     // GPU 한 장 = 한 줄. 점유와 학습을 합쳐 '지금 무엇을 하는가' 한 줄로 쓴다.
     const lines = ((m.gpus || []).length ? m.gpus : [{}]).map((gpu) => {
-      const t = training.find((x) => x.gpu === gpu);
-      const r = t && t.run, a = aiOf(gpu);
+      const tr = training.find((x) => x.gpu === gpu);
+      const r = tr && tr.run, a = aiOf(gpu);
       const stalled = r && r.status !== "running" && num(r.log_age_sec);
       // 진행률이 있는 작업은 맥박 점. 학습이 아닌 작업(데이터 캡처·평가 등)은 '작업 중'으로 부른다.
       const working = a && a.kind && a.kind !== "training";
@@ -524,11 +598,11 @@ function machineTable(machines) {
         : r ? (stalled ? (working ? "wstall" : "stall") : (working ? "work" : "train"))
         : gpu.state === "free" ? "free" : gpu.state === "busy" ? "busy" : "unknown";
       const pendingAi = gpu.ai && gpu.ai.status === "pending";
-      const what = !m.online ? `오프라인 · ${ago(m.age_sec)}`
+      const what = !m.online ? t("offline", ago(m.age_sec))
         : r ? (a ? a.title : r.name)
         : a && gpu.state !== "free" ? a.title
-        : gpu.state === "free" ? "사용 가능"
-        : (gpu.state_reason || "점유") + (pendingAi ? " · AI 확인 중…" : "");
+        : gpu.state === "free" ? t("available")
+        : (gpu.state_reason || t("inUse")) + (pendingAi ? t("aiChecking") : "");
       // 다음 작업: 체인·큐로 실제 예약된 것과 문서상 계획만 있는 것을 구분한다.
       // count: 지금 단계 뒤에 남은 단계 수(다음 작업 포함). 2 이상이면 '외 N개'로 붙인다.
       const next = a && a.next_short && gpu.state !== "free" ? { name: a.next_short, plan: a.next_source !== "chain",
@@ -536,15 +610,13 @@ function machineTable(machines) {
       // 체인 전체 종료는 실제로 예약된 남은 단계가 있을 때만 — 계획은 시각을 약속하지 않는다.
       const rest = a && a.next_source === "chain" && num(a.rest_sec) ? a.rest_sec : null;
       const stages = a && Array.isArray(a.rest_stages) && a.rest_stages.length
-        ? "남은 단계: " + a.rest_stages.map((x) => `${x.name}${num(x.sec) ? ` ${dur(x.sec)}` : ""}`).join(" → ") : null;
-      const tip = [a && a.summary, a && a.next && `다음: ${a.next}`, r && r.dir,
+        ? t("restStages") + a.rest_stages.map((x) => `${x.name}${num(x.sec) ? ` ${dur(x.sec)}` : ""}`).join(" → ") : null;
+      const tip = [a && a.summary, a && a.next && t("next") + a.next, r && r.dir,
                    gpu.state_reason].filter(Boolean).join("\n");
-      const etaTip = [stages, a && a.rest_basis && `추정 근거: ${a.rest_basis}`].filter(Boolean).join("\n");
+      const etaTip = [stages, a && a.rest_basis && t("basis") + a.rest_basis].filter(Boolean).join("\n");
       return { gpu, r, state, what, tip, next, rest, etaTip };
     });
-    const STATE_TEXT = { off: "오프라인", train: "학습 중", stall: "학습 멈춤", work: "작업 중",
-                         wstall: "작업 멈춤", pause: "일시정지", busy: "점유 중",
-                         unknown: "점유 중(불명)", free: "비어있음" };
+    const STATE_TEXT = t("st");
     // 상태는 글자 대신 점 하나로 — 학습 중은 맥박, 멈춤은 주황, 비었으면 초록.
     const dot = `<span class="sdot ${lines[0].state}" role="img" aria-label="${STATE_TEXT[lines[0].state]}"
                    title="${STATE_TEXT[lines[0].state]}"></span>`;
@@ -552,28 +624,28 @@ function machineTable(machines) {
     const prog = `
       <td class="work">${col((l) => `<span title="${esc(l.tip)}">${multi ? `GPU${esc(l.gpu.index)} ` : ""}${esc(l.what)}${
         l.next ? `<span class="nx${l.next.plan ? " plan" : ""}"> → ${esc(l.next.name)}${
-          l.next.count > 1 ? ` 외 ${l.next.count - 1}개` : ""}${l.next.plan ? " (계획)" : ""}</span>` : ""}</span>`)}</td>
+          l.next.count > 1 ? esc(t("more", l.next.count - 1)) : ""}${l.next.plan ? esc(t("planned")) : ""}</span>` : ""}</span>`)}</td>
       <td class="p-pc">${col((l) => l.r ? esc(pct(l.r.progress_pct, 0)) : "")}</td>
       <td class="p-bar">${col((l) => { if (!l.r) return ""; const p = l.r.progress_pct;
         return `<div class="meter ${/stall/.test(l.state) ? "stall" : l.state === "pause" ? "idle" : ""}"><i style="width:${num(p) ? Math.min(100, p).toFixed(1) : 0}%"></i></div>`; })}</td>
       <td class="p-eta">${col((l) => !l.r ? ""
-        : l.state === "pause" ? `<span class="sub">일시정지 · ${esc(dur(l.r.log_age_sec))}째</span>`
+        : l.state === "pause" ? `<span class="sub">${esc(t("pausedFor", dur(l.r.log_age_sec)))}</span>`
         : !/stall/.test(l.state) ? `<span class="sub" title="${esc(l.etaTip)}">${etaHtml(l.gpu.run.eta_sec, m.age_sec, l.rest)}</span>`
         // 프로세스는 GPU 를 물고 있는데 로그가 안 쌓인다 = 멈춤. 남은 시간은 계산할 수 없다.
-        : `<span class="sub stall">멈춤 · ${esc(dur(l.r.log_age_sec))}째 변화 없음</span>`)}</td>`;
+        : `<span class="sub stall">${esc(t("stalledFor", dur(l.r.log_age_sec)))}</span>`)}</td>`;
     const hw = [
       ["GPU", esc(g.name || "—")],
       ["VRAM", num(g.vram_total_mb) ? `${esc(gb(g.vram_total_mb, 1))}GB` : "—"],
-      ["전력", `${esc(nf(g.power_w, 0))} / ${esc(nf(g.power_limit_w, 0))}W`],
-      ["클럭", `${esc(nf(g.clock_mhz, 0))}MHz`],
-      ["팬", esc(pct(g.fan_pct))],
-      ["CPU", `${esc(nf(m.cpu && m.cpu.cores))}코어`],
+      [t("power"), `${esc(nf(g.power_w, 0))} / ${esc(nf(g.power_limit_w, 0))}W`],
+      [t("clock"), `${esc(nf(g.clock_mhz, 0))}MHz`],
+      [t("fan"), esc(pct(g.fan_pct))],
+      ["CPU", esc(t("cores", nf(m.cpu && m.cpu.cores)))],
       ["RAM", esc(bytes(m.memory && m.memory.total_bytes))],
-      ...(m.disks || []).map((d) => [`디스크 ${d.path}`,
-        `${esc(pct(d.pct))} · ${esc(bytes(d.free_bytes))} 남음`]),
-      ["부팅 후", esc(dur(m.uptime_sec))],
-      ["호스트", `${esc(m.hostname || "—")} · ${esc(m.platform || "—")}`],
-      ["AI 식별", esc(aiStatusText(m.ai_status))],
+      ...(m.disks || []).map((d) => [t("disk", d.path),
+        `${esc(pct(d.pct))} · ${esc(t("diskFree", bytes(d.free_bytes)))}`]),
+      [t("uptime"), esc(dur(m.uptime_sec))],
+      [t("host"), `${esc(m.hostname || "—")} · ${esc(m.platform || "—")}`],
+      [t("ai"), esc(aiStatusText(m.ai_status))],
     ];
     // loss 는 GPU 에서 학습이 돌 때만 보인다. 추론 점유나 끝난 런이면 아예 뺀다.
     const lossPart = !training.length ? ""
@@ -592,17 +664,17 @@ function machineTable(machines) {
     <tr class="mdet" data-id="${esc(m.machine_id)}"${open ? "" : " hidden"}><td colspan="6">
       <dl class="kv">${hw.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join("")}</dl>
       ${(m.gpus || []).filter(aiOf).map((x) => `<div class="aibox">
-        <h4>${multi ? `GPU${esc(x.index)} · ` : ""}${esc(x.ai.title)}<span class="sub"> · AI 식별 ${esc(ago(Date.now() / 1000 - x.ai.identified_at))}</span></h4>
+        <h4>${multi ? `GPU${esc(x.index)} · ` : ""}${esc(x.ai.title)}<span class="sub">${esc(t("identified", ago(Date.now() / 1000 - x.ai.identified_at)))}</span></h4>
         <p>${esc(x.ai.summary || "")}</p>
-        ${x.ai.next ? `<p class="sub">다음: ${esc(x.ai.next)}</p>` : ""}
-        ${x.ai.log_path ? `<p class="sub">로그: <code>${esc(x.ai.log_path)}</code></p>` : ""}</div>`).join("")}
+        ${x.ai.next ? `<p class="sub">${esc(t("next") + x.ai.next)}</p>` : ""}
+        ${x.ai.log_path ? `<p class="sub">${esc(t("log"))}<code>${esc(x.ai.log_path)}</code></p>` : ""}</div>`).join("")}
       ${lossPart}
     </td></tr>`;
   }).join("");
   return `<section class="panel wide">
-    <div class="ptitle">머신 ${machines.length}대</div>
+    <div class="ptitle">${esc(t("machines", machines.length))}</div>
     <table class="mtab"><thead><tr>
-      <th></th><th>머신</th><th>지금 하는 일</th><th colspan="3" class="r">진행 · 종료</th>
+      <th></th><th>${esc(t("colMachine"))}</th><th>${esc(t("colWhat"))}</th><th colspan="3" class="r">${esc(t("colProg"))}</th>
     </tr></thead><tbody>${rows}</tbody></table></section>`;
 }
 
@@ -619,21 +691,21 @@ function buildAlerts(machines) {
     // AI 식별이 안 되면 '무엇에 쓰는지'가 비게 된다. 꺼 둔 것(off)은 경고가 아니다.
     const ai = m.ai_status;
     if (ai && ai.state === "error")
-      out.push(["warning", `<b>${esc(who)}</b> AI 식별 안 됨 · ${esc(ai.message)}`]);
+      out.push(["warning", `<b>${esc(who)}</b> ${esc(t("aAi", ai.message))}`]);
     for (const g of m.gpus || []) {
       if (g.temp_c >= 90) out.push(["critical", `<b>${esc(who)}</b> GPU${g.index} ${esc(nf(g.temp_c))}℃`]);
-      if (g.vram_pct >= 96) out.push(["warning", `<b>${esc(who)}</b> GPU${g.index} VRAM ${esc(pct(g.vram_pct))} · OOM 위험`]);
+      if (g.vram_pct >= 96) out.push(["warning", `<b>${esc(who)}</b> GPU${g.index} VRAM ${esc(pct(g.vram_pct))} · ${esc(t("aOom"))}`]);
       // 자동 업데이트로 드라이버 라이브러리만 바뀐 경우 등. 학습은 돌 수 있지만 지표는 비고, 새 작업이 막힐 수 있다.
-      if (g.driver_error) out.push(["warning", `<b>${esc(who)}</b> GPU${g.index} ${esc(g.driver_error)} · GPU 지표를 못 읽는다`]);
+      if (g.driver_error) out.push(["warning", `<b>${esc(who)}</b> GPU${g.index} ${esc(g.driver_error)} · ${esc(t("aDriver"))}`]);
     }
     const ct = m.cpu && m.cpu.temp_c;
-    if (num(ct) && ct >= 90) out.push(["critical", `<b>${esc(who)}</b> CPU ${esc(nf(ct))}℃ · 스로틀링 의심`]);
+    if (num(ct) && ct >= 90) out.push(["critical", `<b>${esc(who)}</b> CPU ${esc(nf(ct))}℃ · ${esc(t("aThrottle"))}`]);
     const mem = m.memory || {};
     if (mem.swap_total_bytes > 0 && mem.swap_used_bytes / mem.swap_total_bytes >= .97 && (mem.pct || 0) >= 75)
-      out.push(["warning", `<b>${esc(who)}</b> 스왑 고갈 + RAM ${esc(pct(mem.pct))}`]);
+      out.push(["warning", `<b>${esc(who)}</b> ${esc(t("aSwap", pct(mem.pct)))}`]);
     for (const d of m.disks || []) {
-      if (d.pct >= 92) out.push(["critical", `<b>${esc(who)}</b> ${esc(d.path)} ${esc(pct(d.pct))} · ${esc(bytes(d.free_bytes))} 남음`]);
-      else if (d.pct >= 85) out.push(["warning", `<b>${esc(who)}</b> ${esc(d.path)} ${esc(pct(d.pct))} 사용`]);
+      if (d.pct >= 92) out.push(["critical", `<b>${esc(who)}</b> ${esc(d.path)} ${esc(pct(d.pct))} · ${esc(t("aDiskLeft", bytes(d.free_bytes)))}`]);
+      else if (d.pct >= 85) out.push(["warning", `<b>${esc(who)}</b> ${esc(d.path)} ${esc(pct(d.pct))} ${esc(t("aDiskUsed"))}`]);
     }
     for (const r of m.runs || [])
       if (r.status === "failed" || r.status === "error")
@@ -642,16 +714,16 @@ function buildAlerts(machines) {
     // 옛 런 로그가 조용한 것은 경고거리가 아니다.
     for (const { gpu, run: r } of trainingRuns(m))
       if (r.status === "idle" && r.log_age_sec > 300 && !gpu.paused)  // 일시정지는 사람이 세운 것
-        out.push(["warning", `<b>${esc(who)}</b> ${esc(r.name)} 진행이 멈췄다 · ${esc(dur(r.log_age_sec))}째 변화 없음 (GPU 는 계속 점유)`]);
+        out.push(["warning", `<b>${esc(who)}</b> ${esc(t("aStall", r.name, dur(r.log_age_sec)))}`]);
   }
   out.sort((a, b) => (a[0] === "critical" ? 0 : 1) - (b[0] === "critical" ? 0 : 1));
   return out;
 }
 
 const aiStatusText = (ai) => !ai ? "—"
-  : ai.state === "ok" ? `켜짐 · ${ai.message}`
-  : ai.state === "off" ? `꺼짐 · ${ai.message}`
-  : ai.state === "checking" ? "확인 중"
+  : ai.state === "ok" ? t("aiOn", ai.message)
+  : ai.state === "off" ? t("aiOff", ai.message)
+  : ai.state === "checking" ? t("aiCheck")
   : ai.message;
 
 // 알림 칸: 한 줄 고정. 가장 급한 경고 하나 + '외 N건'(누르면 전체 목록을 겹쳐 펼친다).
@@ -661,11 +733,11 @@ const plainText = (html) => html.replace(/<[^>]*>/g, "");
 function renderAlerts(alerts) {
   if (alerts.length < 2) alertsOpen = false;
   let html;
-  if (!alerts.length) html = `<div class="abar calm">${ICON.ok}<span class="msg">경고 없음</span></div>`;
+  if (!alerts.length) html = `<div class="abar calm">${ICON.ok}<span class="msg">${esc(t("noAlerts"))}</span></div>`;
   else {
     const [k, msg] = alerts[0], more = alerts.length - 1;
     html = `<div class="abar ${k}">${alertIcon(k)}<span class="msg" title="${plainText(msg)}">${msg}</span>${
-      more ? `<button class="ghost amore" aria-expanded="${alertsOpen}">외 ${more}건 ${alertsOpen ? "▴" : "▾"}</button>` : ""}</div>${
+      more ? `<button class="ghost amore" aria-expanded="${alertsOpen}">${esc(t("moreAlerts", more))} ${alertsOpen ? "▴" : "▾"}</button>` : ""}</div>${
       alertsOpen ? `<div class="alist">${alerts.map(([k2, m2]) =>
         `<div class="alert ${k2}">${alertIcon(k2)}<div>${m2}</div></div>`).join("")}</div>` : ""}`;
   }
@@ -717,12 +789,12 @@ function renderTab(machines, alerts, freeCount, total) {
   running.sort((a, b) => a.progress_pct - b.progress_pct);
   const run = running[0] || null;
   let kind, p = null, label = "", head;
-  if (hot) { kind = "hot"; label = "!"; head = `⚠ 경고 ${hot}건`; }
+  if (hot) { kind = "hot"; label = "!"; head = t("tabAlerts", hot); }
   else if (run) { kind = "run"; p = run.progress_pct;
     head = `${p.toFixed(0)}% ${run.name}` + (running.length > 1 ? ` +${running.length - 1}` : ""); }
-  else if (freeCount) { kind = "free"; label = String(freeCount); head = `빈 GPU ${freeCount}/${total}`; }
-  else { kind = "none"; label = "0"; head = "빈 GPU 없음"; }
-  const title = `${head} · GPU 모니터`;
+  else if (freeCount) { kind = "free"; label = String(freeCount); head = t("tabFree", freeCount, total); }
+  else { kind = "none"; label = "0"; head = t("tabNoFree"); }
+  const title = `${head} · ${t("title")}`;
   if (document.title !== title) document.title = title;
   const key = `${kind}|${label}|${num(p) ? p.toFixed(0) : ""}`;
   if (key !== lastIconKey) { lastIconKey = key;
@@ -760,8 +832,8 @@ function render(data) {
   document.getElementById("chips").innerHTML = machines.map((m) =>
     `<button class="chip ${shown(m) ? "on" : "off"}" data-id="${esc(m.machine_id)}">
        <span class="k" style="background:${colorOf.get(m.machine_id)}"></span>${esc(m.label || m.machine_id)}</button>`).join("");
-  document.getElementById("range").innerHTML = RANGES.map(([s, t]) =>
-    `<button data-sec="${s}" class="${s === rangeSec ? "on" : ""}">${t}</button>`).join("");
+  document.getElementById("range").innerHTML = RANGES.map((s) =>
+    `<button data-sec="${s}" class="${s === rangeSec ? "on" : ""}">${esc(dur(s))}</button>`).join("");
 
   const alerts = buildAlerts(machines);
   renderAlerts(alerts);
@@ -866,8 +938,8 @@ addEventListener("resize", () => { clearTimeout(resizeTimer);
 
 // ---------- 테마 ----------
 const THEME_KEY = "gpumon-theme";
-function applyTheme(t) {
-  if (t) document.documentElement.dataset.theme = t;
+function applyTheme(name) {
+  if (name) document.documentElement.dataset.theme = name;
   else delete document.documentElement.dataset.theme;
   if (lastData) render(lastData);
 }
@@ -877,6 +949,24 @@ document.getElementById("theme").onclick = () => {
   const next = now === "dark" ? "light" : now === "light" ? "" : "dark";
   try { next ? localStorage.setItem(THEME_KEY, next) : localStorage.removeItem(THEME_KEY); } catch (e) {}
   applyTheme(next);
+};
+
+// ---------- 언어 ----------
+function applyLang(lang) {
+  LANG = lang;
+  document.documentElement.lang = lang;
+  document.getElementById("title").textContent = t("title");
+  document.getElementById("theme").textContent = t("theme");
+  document.getElementById("lang").textContent = t("other");
+  document.getElementById("empty").textContent = t("empty");
+  const hold = document.querySelector(".hold"); if (hold) hold.textContent = t("hold");
+  if (lastData) render(lastData);
+}
+applyLang(LANG);
+document.getElementById("lang").onclick = () => {
+  const next = LANG === "ko" ? "en" : "ko";
+  try { localStorage.setItem(LANG_KEY, next); } catch (e) {}
+  applyLang(next);
 };
 
 // ---------- 연결 ----------
@@ -894,7 +984,7 @@ let pollTimer = null, sse = null, sseFailures = 0;
 let pointerHeld = false, heldData = null;
 const holdBadge = document.createElement("div");
 holdBadge.className = "hold"; holdBadge.hidden = true;
-holdBadge.textContent = "글 선택 중 · 실시간 갱신 멈춤";
+holdBadge.textContent = t("hold");
 document.body.appendChild(holdBadge);
 function selecting() {
   const sel = window.getSelection();
@@ -916,7 +1006,7 @@ document.addEventListener("selectionchange", flushHeld);
 
 async function pollOnce() {
   try { liveRender(mergeHistory(await (await fetch("api/all", { cache: "no-store" })).json())); setConn("ok"); }
-  catch (err) { setConn("down", "hub 연결 끊김 · 재연결 중"); }
+  catch (err) { setConn("down", t("connDown")); }
 }
 const startPolling = () => { if (!pollTimer) { pollOnce(); pollTimer = setInterval(pollOnce, 2000); } };
 const stopPolling = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } };

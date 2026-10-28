@@ -19,13 +19,22 @@ It only reads.
 - No session history is saved, and the user's hooks and MCP servers stay off.
 - If Claude Code is too old to enforce this, identification stays off and the dashboard asks for an update.
 
+## Install options
+
+| Option | |
+|---|---|
+| `--port 9000` | Hub port. Default 8787; if it's taken on first install, the next free port is used |
+| `--lang ko` | Screen language (`en` default). Set on the hub, it carries over to every agent installed with its line. Viewers can switch with the button on the dashboard |
+| `--label NAME` | Server name on the dashboard (default: hostname). With the one-line install: `\| bash -s -- --label NAME` |
+| `--no-agent` | Hub only, even if the hub server has a GPU |
+| `--no-ai` | Turn off AI job identification |
+
 ## Managing
 
 | Task | How |
 |---|---|
 | Logs | `journalctl --user -u gpu-monitor-agent -f` (hub: `gpu-monitor-hub`) |
 | Change settings | Edit `monitor.env`, then `systemctl --user restart gpu-monitor-agent`. Options: [`monitor.env.example`](../monitor.env.example) |
-| Name a server | End the install line with `\| bash -s -- --label NAME` (default: hostname) |
 | Update | Hub: `git pull && ./install.sh hub`. GPU servers: run the install line again |
 | Uninstall | `./install.sh uninstall`. One-line installs: `~/gpu-monitor/install.sh uninstall` |
 

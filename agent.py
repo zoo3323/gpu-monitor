@@ -39,7 +39,53 @@ import time
 import urllib.error
 import urllib.request
 
-AGENT_VERSION = "2.11.0"
+AGENT_VERSION = "2.12.0"
+
+# 화면에 보이는 문구의 언어: en(기본) | ko. 에이전트가 만드는 문구(빈 GPU 사유·AI 상태)와
+# AI 가 쓰는 작업 설명이 이 언어로 나온다. main() 이 --lang / $MONITOR_LANG 으로 정한다.
+LANG = "en"
+MSG = {
+    "workers": ("{n} workers", "워커 {n}"),
+    "others": ("+{n} more", "외 {n}개"),
+    "graphics": ("graphics {who}", "그래픽 {who}"),
+    "no_proc": ("in use, but no process found", "점유 중이지만 프로세스를 찾지 못했습니다"),
+    "free": ("available", "사용 가능"),
+    "free_graphics": ("available ({n} graphics, VRAM {mb:.0f}MB)", "사용 가능 (그래픽 {n}개, VRAM {mb:.0f}MB)"),
+    "free_opaque": ("available (excluding {mb:.0f}MB always in use)", "사용 가능 (상시 점유 {mb:.0f}MB 제외)"),
+    "paused": (" · paused (SIGSTOP)", " · 일시정지(정지 신호)"),
+    "idle_now": (" — GPU idle right now (util {u:.0f}%, VRAM {mb:.0f}MB)",
+                 " — 지금 GPU는 쉬는 중 (util {u:.0f}%, VRAM {mb:.0f}MB)"),
+    "free_guess": ("available (guess) · ", "사용 가능(추정) · "),
+    "driver_mismatch": ("driver mismatch · reboot needed", "드라이버 불일치 · 재부팅 필요"),
+    "smi_failed": ("nvidia-smi failed: {text}", "nvidia-smi 실패: {text}"),
+    "smi_no_gpu": ("nvidia-smi reports no GPU", "nvidia-smi가 GPU를 보고하지 않습니다"),
+    "ai_checking": ("checking", "확인 중"),
+    "ai_failed": ("identification failed: {err}", "식별 실패: {err}"),
+    "ai_cmd_missing": ("no claude at MONITOR_AI_CMD: {path}", "MONITOR_AI_CMD에 claude가 없습니다: {path}"),
+    "ai_need_install": ("Claude Code is not installed — curl -fsSL https://claude.ai/install.sh | bash",
+                        "Claude Code가 없습니다 — 설치: curl -fsSL https://claude.ai/install.sh | bash"),
+    "ai_not_installed": ("Claude Code is not installed (turns on by itself once installed and logged in)",
+                         "Claude Code가 없습니다 (설치하고 로그인하면 자동으로 켜집니다)"),
+    "ai_no_key": ("MONITOR_AI_AUTH=api_key but ANTHROPIC_API_KEY is not set",
+                  "MONITOR_AI_AUTH=api_key인데 ANTHROPIC_API_KEY가 없습니다"),
+    "ai_api_key": ("API key", "API 키"),
+    "ai_need_login": ("Claude login needed — on this server run: claude auth login",
+                      "Claude 로그인이 필요합니다 — 이 서버에서 claude auth login"),
+    "ai_sub": ("claude.ai subscription ({plan})", "claude.ai 구독 ({plan})"),
+    "ai_login": ("claude.ai login", "claude.ai 로그인"),
+    "ai_too_old": ("Claude Code is too old — on this server run: claude update",
+                   "Claude Code가 오래됐습니다 — 이 서버에서 claude update"),
+    "ai_off": ("turned off (MONITOR_AI=off)", "꺼 둠 (MONITOR_AI=off)"),
+    "ai_no_json": ("no result JSON in the answer", "답에서 결과 JSON을 찾지 못했습니다"),
+    "ai_exit": ("claude exited with code {code}", "claude 종료 코드 {code}"),
+    "ai_error": ("error", "오류"),
+    "ai_unknown": ("unknown error", "알 수 없는 오류"),
+}
+
+
+def T(key, **kw):
+    en, ko = MSG[key]
+    return (ko if LANG == "ko" else en).format(**kw)
 # 스냅샷 스키마. 2 부터 학습 전용 필드(train_processes/eval_processes)가 없고
 # GPU 점유자 목록(gpu_processes)이 정본이다.
 SCHEMA = 2
@@ -329,10 +375,10 @@ def collect_gpus():
         gpus = _collect_gpus_smi()
     except Exception as exc:  # noqa: BLE001
         text = str(exc)
-        error = ("드라이버 불일치 · 재부팅 필요" if "mismatch" in text.lower()
-                 else f"nvidia-smi 실패: {text[:120]}")
+        error = (T("driver_mismatch") if "mismatch" in text.lower()
+                 else T("smi_failed", text=text[:120]))
         return gpus_from_driver(error)
-    return gpus or gpus_from_driver("nvidia-smi 가 GPU 를 보고하지 않음")
+    return gpus or gpus_from_driver(T("smi_no_gpu"))
 
 
 def _collect_gpus_smi():
@@ -679,9 +725,9 @@ def attach_processes(gpus, procs, opaque):
             others = len(procs) - 1 - len(same)
             parts = []
             if same:
-                parts.append(f"워커 {len(same)}")
+                parts.append(T("workers", n=len(same)))
             if others:
-                parts.append(f"외 {others}개")
+                parts.append(T("others", n=others))
             return (" · " + " · ".join(parts)) if parts else ""
 
         if compute:
@@ -693,18 +739,18 @@ def attach_processes(gpus, procs, opaque):
                       else f"VRAM {used:.0f}MB")
             if graphics:
                 state = "busy"
-                reason = f"{metric} · 그래픽 {who(graphics[0])}{group_suffix(graphics)}"
+                reason = f"{metric} · {T('graphics', who=who(graphics[0]))}{group_suffix(graphics)}"
             else:
-                reason = f"{metric} — 점유 중이지만 프로세스를 특정 못 했다"
+                reason = f"{metric} — {T('no_proc')}"
         else:
             state = "free"
             if graphics:
-                reason = f"사용 가능 (그래픽 {len(graphics)}개, VRAM {used:.0f}MB)"
+                reason = T("free_graphics", n=len(graphics), mb=used)
             elif opaque and used > FREE_VRAM_MB:
                 # 창 관리자 상시 점유는 작업을 막지 않는다 — 오해를 없앤다.
-                reason = f"사용 가능 (상시 점유 {used:.0f}MB 제외)"
+                reason = T("free_opaque", mb=used)
             else:
-                reason = "사용 가능"
+                reason = T("free")
 
         # 작업 본체가 정지 신호로 서 있으면 로그가 안 쌓여도 고장이 아니라 일시정지다.
         # 사람이 '잠깐 멈춰'로 세워 둔 학습이 '멈춤 · N시간째 변화 없음'으로 보이면
@@ -712,18 +758,18 @@ def attach_processes(gpus, procs, opaque):
         lead = gpu_leader({"processes": compute})
         paused = bool(lead and lead.get("state") == "T")
         if paused:
-            reason += " · 일시정지(정지 신호)"
+            reason += T("paused")
 
         # 프로세스는 살아 있는데 GPU 지표가 조용한 구간은 이유를 적어 준다.
         # 데이터 로드·체크포인트 저장·CPU 전처리가 모두 여기 해당한다. 이 문구가
         # 없으면 'GPU 0% 인데 점유 중' 이 오작동으로 보인다.
         if (compute and not paused and util <= FREE_UTIL_PCT and used <= vram_floor
                 and not gpu.get("driver_error")):  # 지표를 못 읽었으면 '쉬는 중'이라 말할 수 없다
-            reason += f" — 지금 GPU 는 쉬는 중 (util {util:.0f}%, VRAM {used:.0f}MB)"
+            reason += T("idle_now", u=util, mb=used)
 
         if gpu.get("driver_error"):
             # 지표를 못 읽으니 '사용 가능'도 프로세스 목록만 보고 한 추정이다.
-            reason = (reason + " · " if state != "free" else "사용 가능(추정) · ") + gpu["driver_error"]
+            reason = (reason + " · " if state != "free" else T("free_guess")) + gpu["driver_error"]
         gpu["state"] = state
         gpu["state_reason"] = reason
         gpu["paused"] = paused
@@ -1593,51 +1639,64 @@ def find_claude(hint=None):
                 return path
     return None
 
-AI_PROMPT = """너는 GPU 모니터의 식별기다. 아래 프로세스가 GPU 를 쓰고 있다. 이것이 정확히
-무슨 작업인지, 그리고 진행률을 어느 로그에서 읽으면 되는지 알아내라.
+AI_PROMPT = """You identify jobs for a GPU monitor. The process below is using a GPU. Find out exactly
+what this job is, and which log its progress can be read from.
 
-머신: {label} / GPU: {gpu}
-점유 프로세스(주 프로세스):
+Machine: {label} / GPU: {gpu}
+Process holding the GPU (main process):
 {facts}
 
-해야 할 일:
-1. 명령줄의 설정 파일, 작업 디렉터리, 열린 파일, 부모 프로세스(큐·러너 스크립트)를 읽어라.
-   실험 디렉터리에 있는 plan/receipt/status/README 류 파일도 보라.
-2. 이 프로세스가 지금 쓰고 있는 JSONL 학습 로그(step 기록이 계속 쌓이는 파일)를 찾아라.
-   stat 으로 수정 시각이 최근인지 보고, 마지막 줄은 wc -l 로 줄 수를 잰 뒤 Read 의 offset 으로
-   끝부분만 읽어라(큰 로그를 처음부터 읽지 마라). 없으면 null.
-   학습이 아니라 step 기록이 없는 작업(데이터 생성·캡처·평가·추출 등)이면, 진행 개수를 무엇으로
-   셀 수 있는지 찾아라: 한 단위마다 한 줄씩 늘어나는 파일, 또는 로그에 찍히는 진행 숫자
-   (예: "records=682"). 목표 개수는 설정·스케줄 파일에서 읽어라(지금 단계·블록의 목표).
-3. 여러 단계(예: smoke→pretrain→finetune→eval)로 이어지는 파이프라인이면 지금 단계와
-   남은 단계를 적어라. 다음 작업이 실제로 예약돼 있는지(부모 러너·큐·체인 스크립트가
-   이어서 실행함) 아니면 문서(plan/README/NEXT.md)에만 적힌 계획인지 구분하라.
-4. 체인으로 예약된 남은 단계가 있으면, 지금 단계 '다음'부터 체인 끝까지의 단계를 순서대로
-   나열하고 각 단계의 소요를 초 단위로 추정하라. 지금 단계(남은 부분 포함)는 목록에 넣지
-   마라 — 지금 단계의 남은 시간은 코드가 로그로 따로 계산해 더한다. 근거 우선순위:
-   (a) 같은 체인·같은 설정으로 이미 끝난 단계의 실제 소요(로그 첫 줄과 마지막 줄의 time 차),
-   (b) 남은 step 수 ÷ 지금 단계의 속도(같은 모델·해상도일 때),
-   (c) 평가·채점처럼 짧은 단계는 이전 실행의 소요.
-   근거가 없으면 null.
-파일은 읽기만 하라. 아무것도 수정·실행·중단하지 마라.
+Steps:
+1. Read the config files on the command line, the working directory, open files and parent processes
+   (queue or runner scripts). Also look at plan/receipt/status/README-like files in the experiment folder.
+2. Find the JSONL training log this process is writing now (a file that keeps growing with per-step records).
+   Check with stat that it was modified recently. For the last line, count lines with wc -l and read only the
+   end with Read's offset (never read a big log from the start). If there is none, null.
+   If the job is not training and has no step records (data generation, capture, evaluation, extraction ...),
+   find what its progress can be counted by: a file that grows by one line per unit, or a progress number
+   printed to a log (e.g. "records=682"). Read the target count from config or schedule files (the target of
+   the current stage or block).
+3. If it is a pipeline of several stages (e.g. smoke -> pretrain -> finetune -> eval), give the current stage and
+   the remaining ones. Tell whether the next job is actually scheduled (a parent runner, queue or chain script
+   will run it) or only planned in documents (plan/README/NEXT.md).
+4. If remaining stages are scheduled by a chain, list them in order from the one after the current stage to the
+   end of the chain, and estimate each one's duration in seconds. Leave out the current stage, even its
+   remaining part — code computes that from the log and adds it. Basis, in order of preference:
+   (a) the actual duration of stages already finished in the same chain with the same settings (time between
+       the first and last log lines),
+   (b) remaining steps / the current stage's speed (same model and resolution),
+   (c) for short stages such as evaluation or scoring, the duration of a previous run.
+   If there is no basis, null.
+Only read files. Do not modify, run or stop anything.
 
-마지막 답은 JSON 객체 하나만 출력하라(설명·코드펜스 금지):
+Write every human-readable value (title, summary, stage, next, next_short, rest_stages names, rest_basis)
+in {language}.
+
+Output exactly one JSON object as the final answer (no explanation, no code fences):
 {{"kind": "training|evaluation|inference|other",
-  "title": "화면에 띄울 짧은 이름, 24자 이내 (예: 1280 stride4 사전학습)",
-  "summary": "무슨 실험이고 무엇을 확인하려는지 한두 문장, 한국어. 현재 step·진행률은 넣지 마라(코드가 따로 계산한다)",
-  "run_dir": "런 디렉터리 절대경로 또는 null",
-  "log_path": "진행률을 읽을 JSONL 절대경로 또는 null",
-  "stage": "지금 단계 이름 또는 null",
-  "next": "이 단계 뒤에 남은 작업 한 줄, 없으면 null",
-  "next_short": "바로 다음 작업의 아주 짧은 이름, 16자 이내 (예: 본학습, eval·채점), 없으면 null",
-  "next_source": "chain(스크립트·큐가 실제로 이어서 실행) | plan(문서에만 있는 계획) | null",
-  "rest_stages": [{{"name": "지금 단계 다음 단계 이름", "sec": 예상 소요 초(정수)}}, ...] 체인 끝까지, 예약된 게 없거나 추정 못 하면 [],
-  "rest_basis": "추정 근거 한 줄 또는 null",
-  "total_steps": 로그에 전체 step 수가 없을 때만 설정에서 읽은 정수, 아니면 null,
-  "progress": step 로그가 없는 작업일 때만 진행 개수를 세는 법, 아니면 null.
-    {{"kind": "lines", "path": "한 단위마다 한 줄씩 늘어나는 파일 절대경로", "total": 지금 단계 목표 개수}}
-    또는 {{"kind": "regex", "path": "로그 파일 절대경로", "pattern": "진행 개수를 잡는 파이썬 정규식, 괄호 그룹 하나 (예: records=(\\d+))", "total": 지금 단계 목표 개수}}}}
+  "title": "short name for the screen, at most {title_max} (e.g. {title_example})",
+  "summary": "one or two sentences on what experiment this is and what it tries to find out. Leave out the current step and progress (code computes them)",
+  "run_dir": "absolute path of the run directory, or null",
+  "log_path": "absolute path of the JSONL log to read progress from, or null",
+  "stage": "name of the current stage, or null",
+  "next": "one line on the work left after this stage, or null",
+  "next_short": "very short name of the next job, at most {next_max} (e.g. {next_example}), or null",
+  "next_source": "chain (a script or queue will actually run it next) | plan (only planned in documents) | null",
+  "rest_stages": [{{"name": "a stage after the current one", "sec": estimated seconds (integer)}}, ...] to the end of the chain; [] if nothing is scheduled or you can't estimate,
+  "rest_basis": "one line on what the estimate is based on, or null",
+  "total_steps": integer read from the config only when the log lacks the total step count, otherwise null,
+  "progress": only for jobs without a step log, how to count progress, otherwise null.
+    {{"kind": "lines", "path": "absolute path of a file that grows by one line per unit", "total": target count of the current stage}}
+    or {{"kind": "regex", "path": "absolute path of the log file", "pattern": "Python regex with one group capturing the progress count (e.g. records=(\\d+))", "total": target count of the current stage}}}}
 """
+# 답의 언어. 캐시에 언어를 같이 남겨, 언어를 바꾸면 다시 묻는다.
+AI_LANG = {
+    "en": dict(language="English", title_max="32 characters", title_example="ViT-B/16 pretraining",
+               next_max="20 characters", next_example="finetune, eval"),
+    "ko": dict(language="Korean; write sentences in the polite form ending in ~합니다",
+               title_max="24 Korean characters", title_example="ViT-B/16 사전학습",
+               next_max="16 Korean characters", next_example="파인튜닝, eval·채점"),
+}
 
 
 def _read_cmdline(pid):
@@ -1763,7 +1822,7 @@ class AiIdentifier:
         # 상태: 준비됐나(claude 있음·읽기 전용 가능·로그인) / 아니면 왜 / 최근 식별 실패
         self.ready = False
         self.off = False
-        self.problem = "확인 중"
+        self.problem = T("ai_checking")
         self.account = ""
         self.last_error: str | None = None
         self._checked_at = 0.0
@@ -1784,7 +1843,7 @@ class AiIdentifier:
                              timeout=30, stdin=subprocess.DEVNULL)
         text = out.stdout + out.stderr
         if "--permission-mode" not in text or "dontAsk" not in text:
-            raise RuntimeError("Claude Code 가 오래됐다 — 이 서버에서 claude update")
+            raise RuntimeError(T("ai_too_old"))
         flags = []
         for name, args in AI_OPTIONAL_FLAGS:
             if name in text:
@@ -1801,11 +1860,11 @@ class AiIdentifier:
             if self.off:
                 return {"state": "off", "message": self.problem}
             if not self.ready and self._checked_at == 0.0 and not self.last_error:
-                return {"state": "checking", "message": "확인 중"}  # 켜자마자 오류로 띄우지 않는다
+                return {"state": "checking", "message": T("ai_checking")}  # 켜자마자 오류로 띄우지 않는다
             if not self.ready:
                 return {"state": "error", "message": self.problem}
             if self.last_error:
-                return {"state": "error", "message": f"식별 실패: {self.last_error}"}
+                return {"state": "error", "message": T("ai_failed", err=self.last_error)}
             return {"state": "ok", "message": self.account}
 
     def _maybe_check(self, now):
@@ -1822,19 +1881,19 @@ class AiIdentifier:
             command = find_claude(self.command_hint)
             if command is None:
                 if self.command_hint:
-                    problem = f"MONITOR_AI_CMD 에 claude 가 없다: {self.command_hint}"
+                    problem = T("ai_cmd_missing", path=self.command_hint)
                 elif self.required:
-                    problem = "Claude Code 가 없다 — 설치: curl -fsSL https://claude.ai/install.sh | bash"
+                    problem = T("ai_need_install")
                 else:
-                    off, problem = True, "Claude Code 가 없다 (설치하고 로그인하면 저절로 켜진다)"
+                    off, problem = True, T("ai_not_installed")
             else:
                 if command != self.command:
                     self.command, self._extra_flags = command, None
                 self._claude_flags()
                 if self.auth == "api_key":
                     ready = bool(os.environ.get("ANTHROPIC_API_KEY"))
-                    problem = "" if ready else "MONITOR_AI_AUTH=api_key 인데 ANTHROPIC_API_KEY 가 없다"
-                    account = "API 키"
+                    problem = "" if ready else T("ai_no_key")
+                    account = T("ai_api_key")
                 else:
                     out = subprocess.run([command, "auth", "status", "--json"], capture_output=True,
                                          text=True, timeout=30, stdin=subprocess.DEVNULL,
@@ -1846,11 +1905,11 @@ class AiIdentifier:
                     if not isinstance(info, dict):
                         info = {}
                     if info.get("loggedIn") is False:
-                        problem = "Claude 로그인이 필요하다 — 이 서버에서 claude auth login"
+                        problem = T("ai_need_login")
                     else:
                         ready = True
                         plan = info.get("subscriptionType")
-                        account = f"claude.ai 구독 ({plan})" if plan else "claude.ai 로그인"
+                        account = T("ai_sub", plan=plan) if plan else T("ai_login")
         except Exception as exc:  # noqa: BLE001
             problem = str(exc)[:200] or type(exc).__name__
         with self.lock:
@@ -1886,6 +1945,8 @@ class AiIdentifier:
             return None
         if result.get("schema") != AI_SCHEMA:
             return None
+        if result.get("lang", "ko") != LANG:  # 언어를 바꿨다 — 그 언어로 다시 묻는다(옛 캐시는 한국어)
+            return None
         self.results[key] = result
         return result
 
@@ -1901,16 +1962,16 @@ class AiIdentifier:
         return f"{gpu.get('uuid') or gpu.get('index')}-{leader['pid']}-{start}"
 
     def _facts(self, leader):
-        lines = [f"pid {leader['pid']} (사용자 {leader.get('user')}, "
-                 f"실행 {int(leader.get('elapsed_sec') or 0)}초째)",
-                 f"명령줄: {leader.get('cmdline')}",
-                 f"작업 디렉터리: {leader.get('cwd')}"]
+        lines = [f"pid {leader['pid']} (user {leader.get('user')}, "
+                 f"running for {int(leader.get('elapsed_sec') or 0)}s)",
+                 f"command line: {leader.get('cmdline')}",
+                 f"working directory: {leader.get('cwd')}"]
         opened = [p for p in process_paths({"pid": leader["pid"]})]
         if opened:
-            lines.append("열린 파일: " + ", ".join(opened[:20]))
+            lines.append("open files: " + ", ".join(opened[:20]))
         chain = _parent_chain(leader["pid"])
         if chain:
-            lines.append("부모 프로세스:\n  " + "\n  ".join(chain))
+            lines.append("parent processes:\n  " + "\n  ".join(chain))
         return "\n".join(lines)
 
     def _ask(self, key, gpu_name, leader):
@@ -1919,7 +1980,8 @@ class AiIdentifier:
         error = None
         try:
             # 프롬프트도 try 안에서 만든다 — 여기서 죽으면 running 이 풀리지 않아 식별이 영영 멈춘다.
-            prompt = AI_PROMPT.format(label=self.label, gpu=gpu_name, facts=self._facts(leader))
+            prompt = AI_PROMPT.format(label=self.label, gpu=gpu_name, facts=self._facts(leader),
+                                      **AI_LANG.get(LANG, AI_LANG["en"]))
             proc = subprocess.run(
                 [self.command, "-p", prompt, "--output-format", "json",
                  "--model", AI_MODEL, "--effort", AI_EFFORT, "--max-turns", "30",
@@ -1936,20 +1998,21 @@ class AiIdentifier:
                 outer = None
             if not isinstance(outer, dict):
                 lines = (proc.stderr or proc.stdout or "").strip().splitlines()
-                raise RuntimeError(lines[-1][:200] if lines else f"claude 종료 코드 {proc.returncode}")
+                raise RuntimeError(lines[-1][:200] if lines else T("ai_exit", code=proc.returncode))
             if outer.get("is_error"):
                 raise RuntimeError(str(outer.get("result") or outer.get("terminal_reason")
-                                       or outer.get("subtype") or "오류")[:200])
+                                       or outer.get("subtype") or T("ai_error"))[:200])
             text = outer.get("result") or ""
             match = re.search(r"\{.*\}", text, re.S)
             answer = json.loads(match.group(0)) if match else None
             if not (isinstance(answer, dict) and answer.get("title")):
-                raise RuntimeError("답에서 결과 JSON 을 찾지 못했다")
+                raise RuntimeError(T("ai_no_json"))
             if isinstance(answer, dict) and answer.get("title"):
                 if answer.get("kind") not in AI_KINDS:
                     answer["kind"] = "other"
                 answer["identified_at"] = time.time()
                 answer["schema"] = AI_SCHEMA
+                answer["lang"] = LANG
                 if answer.get("next_source") not in ("chain", "plan"):
                     answer["next_source"] = None
                 # 남은 단계 합계는 코드가 낸다. 단계 하나라도 추정이 비면 합계도 모른다고 본다.
@@ -1969,7 +2032,7 @@ class AiIdentifier:
             self.running = None
             if result is None:
                 self.failed_at[key] = time.time()
-                self.last_error = error or "알 수 없는 오류"
+                self.last_error = error or T("ai_unknown")
                 self._checked_at = 0.0  # 로그인 만료 같은 원인을 곧바로 다시 본다
                 return
             self.results[key] = result
@@ -2165,7 +2228,7 @@ def build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus):
         "runs": runs,
         "notes": args.note or None,
         "ai_status": (args.ai.brief() if getattr(args, "ai", None) is not None
-                      else {"state": "off", "message": "꺼 둠 (MONITOR_AI=off)"}),
+                      else {"state": "off", "message": T("ai_off")}),
     }
 
 
@@ -2230,6 +2293,10 @@ def main():
     )
     parser.add_argument("--note", help="화면에 함께 띄울 짧은 메모")
     parser.add_argument(
+        "--lang", default=os.environ.get("MONITOR_LANG") or "en",
+        help="화면 문구·AI 작업 설명의 언어: en(기본) | ko  (기본: $MONITOR_LANG)",
+    )
+    parser.add_argument(
         "--ai", dest="ai_mode", default=os.environ.get("MONITOR_AI") or "auto",
         help="AI 식별: auto(claude 가 있으면 켠다, 기본) | on | off  (기본: $MONITOR_AI)",
     )
@@ -2249,6 +2316,10 @@ def main():
     args.run_log = args.run_log or list(RUN_LOG_NAMES)
     if not args.disk:
         args.disk = default_disk_paths()
+    if args.lang not in ("en", "ko"):
+        parser.error(f"MONITOR_LANG 은 en|ko 중 하나다: {args.lang}")
+    global LANG
+    LANG = args.lang
     if args.ai_mode not in ("auto", "on", "off"):
         parser.error(f"MONITOR_AI 는 auto|on|off 중 하나다: {args.ai_mode}")
     if args.ai_auth not in ("subscription", "api_key"):

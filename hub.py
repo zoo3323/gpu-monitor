@@ -34,6 +34,12 @@ DASHBOARD = os.path.join(HERE, "dashboard.html")
 # GPU 서버에서 한 줄로 에이전트를 깔 때 install.sh 가 hub 에서 받아 가는 파일들.
 INSTALL_SH = os.path.join(HERE, "install.sh")
 DIST_FILES = ("agent.py", "run-agent.sh", "watchdog.sh", "install.sh")
+# 화면 언어(en 기본 | ko). 대시보드의 기본 언어가 되고, 설치 한 줄로 붙는 에이전트에도 전해진다.
+LANG = os.environ.get("MONITOR_LANG") if os.environ.get("MONITOR_LANG") in ("en", "ko") else "en"
+
+
+def say(en, ko):
+    return ko if LANG == "ko" else en
 
 # 배치 설정 파일. 토큰을 코드에 박지 않기 위해 여기서 읽는다.
 CONFIG_FILE = os.path.join(HERE, "monitor.env")
@@ -316,21 +322,25 @@ class Handler(BaseHTTPRequestHandler):
         shell = "text/x-shellscript; charset=utf-8"
         given = (parse_qs(query).get("t") or [""])[0]
         if self.store.token and not hmac.compare_digest(given, self.store.token):
-            self._send(200, 'echo "토큰이 맞지 않는다 — hub 서버에서 ./install.sh hub 가 '
-                            '알려 준 줄을 그대로 붙여 넣어라" >&2; exit 1\n', shell)
+            msg = say("Wrong token — paste the exact line that ./install.sh hub printed on the hub server",
+                      "토큰이 맞지 않습니다 — hub 서버에서 ./install.sh hub 가 알려 준 줄을 그대로 붙여 넣으세요")
+            self._send(200, f"echo {shlex.quote(msg)} >&2; exit 1\n", shell)
             return
         host = self.headers.get("Host") or ""
         if not re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{1,255}", host):
-            self._send(200, 'echo "Host 헤더가 이상하다" >&2; exit 1\n', shell)
+            msg = say("Bad Host header", "Host 헤더가 올바르지 않습니다")
+            self._send(200, f"echo {shlex.quote(msg)} >&2; exit 1\n", shell)
             return
         try:
             with open(INSTALL_SH, "r", encoding="utf-8") as fh:
                 script = fh.read()
         except OSError:
-            self._send(500, 'echo "hub 에 install.sh 가 없다" >&2; exit 1\n', shell)
+            msg = say("install.sh is missing on the hub", "hub 에 install.sh 가 없습니다")
+            self._send(500, f"echo {shlex.quote(msg)} >&2; exit 1\n", shell)
             return
         script = script.replace('SERVED_HUB=""', f"SERVED_HUB={shlex.quote('http://' + host)}", 1)
         script = script.replace('SERVED_TOKEN=""', f"SERVED_TOKEN={shlex.quote(self.store.token)}", 1)
+        script = script.replace('SERVED_LANG=""', f"SERVED_LANG={LANG}", 1)
         self._send(200, script, shell)
 
     def _serve_file(self, path, content_type):
@@ -346,8 +356,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with open(DASHBOARD, "rb") as fh:
                 body = fh.read()
+            body = body.replace(b'data-default-lang="en"', f'data-default-lang="{LANG}"'.encode(), 1)
         except OSError:
-            self._send(500, "dashboard.html 을 찾을 수 없다", "text/plain; charset=utf-8")
+            self._send(500, say("dashboard.html not found", "dashboard.html 을 찾을 수 없습니다"),
+                       "text/plain; charset=utf-8")
             return
         self._send(200, body, "text/html; charset=utf-8")
 
