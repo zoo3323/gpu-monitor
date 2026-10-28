@@ -1,0 +1,944 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU 모니터</title>
+<link rel="icon" id="favicon" href="data:,">
+<style>
+/* Grafana/Netdata 관례를 따른다: 지표 하나에 패널 하나, 머신은 그 안의 계열.
+   머신이 8 대로 늘어도 패널 수는 그대로다. */
+:root {
+  color-scheme: light;
+  /* 흰 테마는 순백을 피한다. 페이지 바닥을 한 톤 낮추고 패널은 미색으로 띄워서
+     화면 전체가 한 장의 흰 판처럼 번쩍이지 않게 한다. 보조 글자는 대비 4.5:1 이상. */
+  --surface: #f7f6f2; --plane: #e6e5df; --inset: #efeee9;
+  --ink: #1f1e1c; --ink-2: #43423e; --ink-3: #696760;
+  --grid: #dfddd5; --axis: #b5b3a7; --ring: rgba(20,20,10,.14);
+  --track: #dedcd4; --hover: rgba(20,20,10,.05);
+  --shadow: 0 1px 2px rgba(20,20,10,.07), 0 1px 1px rgba(20,20,10,.04);
+  --dot-ring: inset 0 0 0 1px rgba(0,0,0,.18);
+  --good: #0f9a1f; --warning: #d69400; --serious: #e2703f; --critical: #c93434;
+  /* 계열 순서는 고정이다 — 필터로 하나를 빼도 남은 머신 색은 그대로다. */
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+}
+@media (prefers-color-scheme: dark) { :root:where(:not([data-theme="light"])) {
+  color-scheme: dark;
+  --surface: #1a1a19; --plane: #0d0d0d; --inset: #0d0d0d; --shadow: none; --dot-ring: none;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --ink: #fff; --ink-2: #c3c2b7; --ink-3: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
+  --track: #2c2c2a; --hover: rgba(255,255,255,.06);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+} }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #1a1a19; --plane: #0d0d0d; --inset: #0d0d0d; --shadow: none; --dot-ring: none;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --ink: #fff; --ink-2: #c3c2b7; --ink-3: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
+  --track: #2c2c2a; --hover: rgba(255,255,255,.06);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--plane); color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+h1 { margin: 0; font-size: 16px; font-weight: 600; }
+
+/* ---------- 머리말: 필터 한 줄 + 시간 범위 ---------- */
+header { position: sticky; top: 0; z-index: 5; background: var(--surface);
+  border-bottom: 1px solid var(--ring); padding: 9px 18px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.spacer { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; }
+.seg button { font: inherit; font-size: 12.5px; padding: 3px 11px; cursor: pointer;
+  background: transparent; border: 0; border-right: 1px solid var(--ring); color: var(--ink-2); }
+.seg button:last-child { border-right: 0; }
+.seg button.on { background: var(--hover); color: var(--ink); font-weight: 600; }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
+  padding: 3px 10px; border: 1px solid var(--ring); border-radius: 999px;
+  cursor: pointer; color: var(--ink-2); background: transparent; font-family: inherit; }
+.chip .k { width: 13px; height: 3px; border-radius: 2px; background: currentColor; }
+.chip.on { color: var(--ink); background: var(--hover); }
+.chip.off { opacity: .45; }
+.conn { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 12.5px; }
+.conn[hidden] { display: none; }
+.conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+.conn.down .dot { background: var(--critical); }
+button.ghost { font: inherit; font-size: 12.5px; color: var(--ink-2); cursor: pointer;
+  background: transparent; border: 1px solid var(--ring); border-radius: 8px; padding: 3px 10px; }
+button.ghost:hover { background: var(--hover); color: var(--ink); }
+
+/* ---------- 알림 칸 ----------
+   높이가 고정된 한 줄 칸을 늘 둔다. 경고가 몇 건이든 아래 패널을 밀지 않는다.
+   가장 급한 것 하나만 보이고, 나머지는 '외 N건'을 눌러 패널 위에 겹쳐 펼친다. */
+#alerts { position: relative; z-index: 4; padding: 12px 18px 0; max-width: 1760px; margin: 0 auto; }
+.abar { display: flex; align-items: center; gap: 9px; height: 36px; padding: 0 6px 0 12px;
+  font-size: 13px; border: 1px solid var(--ring); border-radius: 9px; background: var(--surface); }
+.abar .msg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.abar.calm { color: var(--ink-3); }
+.abar.critical { box-shadow: inset 3px 0 0 var(--critical); }
+.abar.warning { box-shadow: inset 3px 0 0 var(--serious); }
+.abar .amore { flex: none; padding: 2px 9px; white-space: nowrap; }
+.alist { position: absolute; left: 18px; right: 18px; top: calc(100% + 4px);
+  max-height: 60vh; overflow: auto; padding: 4px 0; background: var(--surface);
+  border: 1px solid var(--ring); border-radius: 9px; box-shadow: 0 4px 16px rgba(0,0,0,.14); }
+.alert { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; padding: 6px 12px; }
+.alert + .alert { border-top: 1px solid var(--grid); }
+.abar svg, .alert svg { flex: none; }
+.alert svg { margin-top: 3px; }
+.critical > svg { color: var(--critical); }
+.warning > svg { color: var(--serious); }
+.calm > svg { color: var(--good); }
+
+/* ---------- 패널 격자 (Grafana 식) ---------- */
+main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
+  display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(370px, 1fr)); }
+.panel { background: var(--surface); border: 1px solid var(--ring); box-shadow: var(--shadow);
+  border-radius: 12px; padding: 11px 13px 9px; min-width: 0; }
+.panel.wide { grid-column: 1 / -1; }
+.ptitle { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px;
+  font-weight: 600; color: var(--ink-2); margin-bottom: 4px; }
+.ptitle .range { margin-left: auto; font-weight: 400; color: var(--ink-3); font-size: 11.5px; }
+.plot { position: relative; }
+.plot svg { display: block; width: 100%; }
+.axlab { fill: var(--ink-3); font-size: 10px; }
+/* 범례는 계열이 둘 이상이면 항상 있다 — 색만으로 정체를 알게 두지 않는다. */
+.legend { display: flex; flex-wrap: wrap; gap: 3px 14px; margin-top: 6px; font-size: 12px; }
+.legend span.i { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); }
+.legend .k { width: 13px; height: 3px; border-radius: 2px; }
+.legend b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.legend b.warn { color: var(--serious); }
+.legend b.hot { color: var(--critical); }
+
+/* ---------- 머신 표 ---------- */
+.mtab { width: 100%; border-collapse: collapse; font-size: 13px; }
+.mtab th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 11.5px;
+  padding: 0 8px 5px; border-bottom: 1px solid var(--axis); }
+.mtab td { padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+.mtab td.who { white-space: nowrap; width: 1%; }
+/* max-width:0 이어야 표 칸이 내용보다 좁아지며 말줄임된다. */
+.mtab td.work { width: 30%; max-width: 0; white-space: nowrap; font-weight: 500; }
+.mtab td.work > div { overflow: hidden; text-overflow: ellipsis; }
+.mtab td.p-pc { width: 1%; text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; padding-left: 0; }
+.mtab td.p-bar { width: 42%; min-width: 80px; }
+.mtab td.p-bar .meter { margin: 2px 0; height: 14px; border-radius: 5px; }
+.mtab td.p-eta { width: 1%; white-space: nowrap; text-align: right; }
+.mtab td.p-eta .sub { max-width: none; }
+.mtab td.work > div + div, .mtab td.p-pc > div + div, .mtab td.p-eta > div + div { margin-top: 3px; }
+.meter.stall > i { background: var(--serious); }
+/* 다음 작업: 제목보다 한 톤 흐리게. 문서상 계획일 뿐이면 더 흐리게, 기울여서. */
+.mtab td.work .nx { color: var(--ink-3); font-weight: 400; }
+.mtab td.work .nx.plan { font-style: italic; opacity: .8; }
+/* 상태 점 */
+.sdot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 9px;
+  vertical-align: -1px; position: relative; background: var(--axis); box-shadow: var(--dot-ring); }
+.sdot.train, .sdot.work { background: var(--s1); }
+.sdot.train::after, .sdot.work::after { content: ""; position: absolute; inset: -4px; border-radius: 50%;
+  border: 2px solid var(--s1); opacity: 0; animation: sdot-pulse 1.8s ease-out infinite; }
+.sdot.busy, .sdot.unknown { background: var(--warning); }
+.sdot.stall, .sdot.wstall { background: var(--serious); }
+.sdot.pause { background: var(--axis); }
+.sdot.free { background: var(--good); }
+.sdot.off { background: transparent; box-shadow: inset 0 0 0 2px var(--axis); }
+@keyframes sdot-pulse { 0% { transform: scale(.6); opacity: .7; } 100% { transform: scale(1.5); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .sdot.train::after, .sdot.work::after { animation: none; } }
+.mtab .sub.stall { color: var(--serious); font-weight: 500; }
+.hold { position: fixed; right: 16px; bottom: 16px; z-index: 30; padding: 6px 10px;
+  border-radius: 8px; font-size: 12px; background: var(--surface); color: var(--ink-2);
+  border: 1px solid var(--ring); box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+.aibox p { margin: 3px 0 0; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+.aibox p.sub { white-space: normal; max-width: none; }
+/* 폰 폭: 점유 프로세스 칸과 바를 접는다 — 이름·%·종료시각만으로 답이 된다. */
+@media (max-width: 640px) {
+  .mtab td.p-bar { display: none; }
+  .mtab td.work { width: 50%; }
+  .mtab th { white-space: nowrap; }
+  .mtab td.p-eta { white-space: normal; min-width: 9ch; }
+  .mtab td.p-eta .sub { white-space: nowrap; }
+  .mtab td.p-eta .eta-left { display: none; }
+  .mtab td.p-eta .eta-all { display: block; }
+}
+.mtab tr.mrow { cursor: pointer; }
+.mtab tr.mrow:hover td { background: var(--hover); }
+.mtab tr.mrow:focus-visible { outline: 2px solid var(--s1); outline-offset: -2px; }
+.mtab td.caret { width: 1%; padding-right: 0; color: var(--ink-3); }
+.mtab tr.mdet > td { background: var(--inset); padding: 11px 14px 14px; }
+.mtab tr.mdet h4 { margin: 12px 0 0; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.mtab td.r { text-align: right; font-variant-numeric: tabular-nums; }
+.nm { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+.nm .k { width: 3px; height: 13px; border-radius: 2px; }
+.sub { color: var(--ink-3); font-size: 11.5px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; max-width: 34ch; }
+.meter { position: relative; height: 7px; border-radius: 4px; background: var(--track);
+  overflow: hidden; min-width: 90px; margin-top: 4px; }
+.meter > i { position: absolute; inset: 0 auto 0 0; background: var(--s1); }
+.meter.done > i { background: var(--good); }
+.meter.idle > i { background: var(--axis); }
+.meter.failed > i { background: var(--critical); }
+dl.kv { margin: 7px 0 2px; display: grid; gap: 4px 14px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+dl.kv > div { display: flex; justify-content: space-between; gap: 8px;
+  font-size: 11.5px; border-bottom: 1px solid var(--grid); padding-bottom: 3px; }
+dl.kv dt { color: var(--ink-3); margin: 0; flex: none; white-space: nowrap; }
+dl.kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis; }
+
+.tip { position: fixed; z-index: 20; pointer-events: none; background: var(--surface);
+  border: 1px solid var(--ring); border-radius: 8px; padding: 7px 10px; font-size: 12.5px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.14); max-width: 280px; }
+.tip .hd { color: var(--ink-3); font-size: 11px; margin-bottom: 3px; }
+.tip .row { display: flex; align-items: center; gap: 7px; }
+.tip .row b { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; min-width: 4.5ch; }
+.tip .row .k { width: 13px; height: 3px; border-radius: 2px; flex: none; }
+.tip .row span { color: var(--ink-2); }
+#empty { padding: 60px 18px; text-align: center; color: var(--ink-3); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>GPU 모니터</h1>
+  <span id="chips" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+  <span class="spacer"></span>
+  <span class="seg" id="range"></span>
+  <span class="conn" id="conn" hidden><span class="dot"></span><span id="connText"></span></span>
+  <button class="ghost" id="theme">테마</button>
+</header>
+
+<div id="alerts"><div class="abar calm"><span class="msg">&nbsp;</span></div></div>
+<main id="panels"></main>
+<div id="empty" hidden>아직 아무 에이전트도 보고하지 않았다.</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+// =====================================================================
+// 서식
+// =====================================================================
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = (v) => (typeof v === "number" && isFinite(v));
+const nf = (v, d = 0) => num(v) ? v.toLocaleString("ko-KR",
+  { minimumFractionDigits: d, maximumFractionDigits: d }) : "—";
+const pct = (v, d = 0) => num(v) ? nf(v, d) + "%" : "—";
+const bytes = (b) => { if (!num(b)) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return nf(b, b < 10 && i ? 1 : 0) + u[i]; };
+const gb = (mb, d = 1) => num(mb) ? nf(mb / 1024, d) : "—";
+const kstep = (v) => !num(v) ? "—" : v >= 10000 ? nf(v / 1000, 1) + "k" : nf(v);
+const dur = (s) => { if (!num(s)) return "—";
+  if (s < 60) return Math.round(s) + "초";
+  if (s < 3600) return Math.floor(s / 60) + "분";
+  if (s < 86400) return Math.floor(s / 3600) + "시간 " + Math.floor((s % 3600) / 60) + "분";
+  return Math.floor(s / 86400) + "일 " + Math.floor((s % 86400) / 3600) + "시간"; };
+const ago = (s) => !num(s) ? "—" : s < 3 ? "방금" : dur(s) + " 전";
+const autoNum = (v) => { if (!num(v)) return "—";
+  const a = Math.abs(v);
+  if (a !== 0 && (a < 1e-3 || a >= 1e6)) return v.toExponential(2);
+  return nf(v, a < 1 ? 4 : a < 100 ? 3 : 1); };
+const grade = (v, warn, hot) => !num(v) ? "" : v >= hot ? "hot" : v >= warn ? "warn" : "";
+const isCompute = (p) => (p || {}).kind === "compute";
+
+const ICON = {
+  crit: '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5l6.5 12h-13z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 6v3.6M8 11.4v.9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  warn: '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 4.6v4M8 10.8v.9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  ok: '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5.2 8.2l2 2 3.6-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+};
+
+// 색은 머신(개체)에 붙는다. 정렬된 id 순서로 고정 — 필터로 하나를 빼도
+// 남은 머신의 색이 다시 칠해지지 않는다.
+const SLOTS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"];
+let colorOf = new Map();
+function assignColors(machines) {
+  const ids = machines.map((m) => m.machine_id).sort();
+  colorOf = new Map(ids.map((id, i) => [id, `var(${SLOTS[i % SLOTS.length]})`]));
+}
+
+// =====================================================================
+// 시계열 패널 — 지표 하나, 머신은 계열
+// =====================================================================
+const RANGES = [[60, "1분"], [300, "5분"], [600, "10분"]];
+let rangeSec = 300;
+
+function plot(series, { lo, hi, width, fmt, unit = "", thresholds = [] }) {
+  const W = Math.max(280, width), H = 142;
+  const P = { t: 10, r: 10, b: 16, l: 44 };
+  const now = series.now;
+  const x = (t) => P.l + (1 - (now - t) / rangeSec) * (W - P.l - P.r);
+  // 축이 고정이라야 "지금 높은가"를 그림만 보고 답할 수 있다.
+  let d0 = lo, d1 = hi;
+  if (d0 === null) {
+    const all = series.lines.flatMap((s) => s.pts.map((p) => p.v)).filter(num);
+    if (!all.length) { d0 = 0; d1 = 1; }
+    else { d0 = Math.min(...all); d1 = Math.max(...all);
+           const pad = (d1 - d0) * .08 || Math.abs(d1) * .1 || 1; d0 -= pad; d1 += pad; }
+  }
+  const y = (v) => P.t + (1 - (Math.min(d1, Math.max(d0, v)) - d0) / (d1 - d0 || 1)) * (H - P.t - P.b);
+  const ticks = [d0, (d0 + d1) / 2, d1];
+  const grid = ticks.map((t) => `
+    <line x1="${P.l}" x2="${W - P.r}" y1="${y(t).toFixed(1)}" y2="${y(t).toFixed(1)}"
+          stroke="var(--grid)" stroke-width="1"/>
+    <text class="axlab" x="${P.l - 5}" y="${(y(t) + 3.5).toFixed(1)}" text-anchor="end">${esc(fmt(t))}</text>`).join("");
+  // 문턱선: 이 위로 가면 곤란하다는 선. 숫자를 같이 적어 색 혼자 말하지 않게 한다.
+  const thr = thresholds.filter((v) => v > d0 && v < d1).map((v) => `
+    <line x1="${P.l}" x2="${W - P.r}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"
+          stroke="var(--serious)" stroke-width="1" stroke-dasharray="3 3" opacity=".7"/>
+    <text class="axlab" x="${W - P.r}" y="${(y(v) - 3).toFixed(1)}" text-anchor="end"
+          fill="var(--serious)">${esc(fmt(v))}</text>`).join("");
+  const paths = series.lines.map((s) => {
+    if (s.pts.length < 2) return "";
+    const d = s.pts.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)} ${y(p.v).toFixed(1)}`).join(" ");
+    const last = s.pts[s.pts.length - 1];
+    return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2"
+                  stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${x(last.t).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="3.5"
+              fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img">
+    ${grid}${thr}
+    <line x1="${P.l}" x2="${W - P.r}" y1="${H - P.b}" y2="${H - P.b}" stroke="var(--axis)" stroke-width="1"/>
+    ${paths}
+    <text class="axlab" x="${P.l}" y="${H - 4}">${esc(dur(rangeSec))} 전</text>
+    <text class="axlab" x="${W - P.r}" y="${H - 4}" text-anchor="end">지금</text>
+    <g class="cross" hidden><line y1="${P.t}" y2="${H - P.b}" stroke="var(--axis)" stroke-width="1"/></g>
+  </svg>`;
+}
+
+// =====================================================================
+// 도구설명 — 십자선이 X 를 찾고, 한 번에 모든 계열을 읽어준다
+// =====================================================================
+const tipEl = document.getElementById("tip");
+function showTip(ev, html) {
+  tipEl.innerHTML = html; tipEl.hidden = false;
+  const r = tipEl.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY - r.height - 10;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y < 8) y = ev.clientY + 16;
+  tipEl.style.left = x + "px"; tipEl.style.top = y + "px";
+}
+const hideTip = () => { tipEl.hidden = true; };
+
+function bindPlot(box, series, fmt, head) {
+  const svg = box.querySelector("svg");
+  if (!svg) return;
+  const cross = svg.querySelector(".cross"), cline = cross.querySelector("line");
+  const vb = svg.viewBox.baseVal;
+  svg.addEventListener("pointermove", (ev) => {
+    const b = svg.getBoundingClientRect();
+    const sx = (ev.clientX - b.left) * (vb.width / b.width);
+    let anchor = null, rows = [];
+    for (const s of series.lines) {
+      if (!s.pts.length) continue;
+      let best = s.pts[0], bx = 0;
+      for (const p of s.pts) {
+        const px = 44 + (1 - (series.now - p.t) / rangeSec) * (vb.width - 54);
+        if (Math.abs(px - sx) < Math.abs(bx - sx)) { best = p; bx = px; }
+      }
+      if (anchor === null || Math.abs(bx - sx) < Math.abs(anchor - sx)) anchor = bx;
+      rows.push({ s, p: best });
+    }
+    if (anchor === null) return;
+    cross.removeAttribute("hidden");
+    cline.setAttribute("x1", anchor); cline.setAttribute("x2", anchor);
+    // 값이 먼저, 이름이 뒤 — 여기서는 독자가 계열을 알고 숫자를 원한다.
+    showTip(ev, `<div class="hd">${esc(head(rows[0] && rows[0].p))}</div>` +
+      rows.map(({ s, p }) => `<div class="row"><span class="k" style="background:${s.color}"></span>
+        <b>${esc(fmt(p.v))}</b><span>${esc(s.name)}</span></div>`).join(""));
+  });
+  svg.addEventListener("pointerleave", () => { cross.setAttribute("hidden", ""); hideTip(); });
+}
+
+// =====================================================================
+// 패널 정의 — 지표 하나가 한 칸이다
+// =====================================================================
+const pf = (v) => nf(v, 0) + "%";
+const tf = (v) => nf(v, 0) + "℃";
+const METRICS = [
+  { key: "gu", title: "GPU 사용률", lo: 0, hi: 100, fmt: pf,
+    pick: (m) => (m.gpus || [])[0], hist: (h, i) => ((h.gpus || []).find((g) => g.i === i) || {}).u,
+    cur: (m, g) => g && g.util_pct },
+  { key: "gv", title: "VRAM", lo: 0, hi: 100, fmt: pf, thresholds: [95],
+    hist: (h, i) => ((h.gpus || []).find((g) => g.i === i) || {}).v,
+    cur: (m, g) => g && g.vram_pct, warn: [85, 95] },
+  { key: "gt", title: "GPU 온도", lo: 25, hi: 100, fmt: tf, thresholds: [90],
+    hist: (h, i) => ((h.gpus || []).find((g) => g.i === i) || {}).c,
+    cur: (m, g) => g && g.temp_c, warn: [80, 90] },
+  { key: "cu", title: "CPU 사용률", lo: 0, hi: 100, fmt: pf,
+    hist: (h) => h.cpu_util, cur: (m) => m.cpu && m.cpu.util_pct },
+  { key: "ru", title: "RAM", lo: 0, hi: 100, fmt: pf, thresholds: [95],
+    hist: (h) => h.ram_pct, cur: (m) => m.memory && m.memory.pct, warn: [85, 95] },
+  { key: "ct", title: "CPU 온도", lo: 25, hi: 100, fmt: tf, thresholds: [90],
+    hist: (h) => h.cpu_temp, cur: (m) => m.cpu && m.cpu.temp_c, warn: [85, 90] },
+];
+
+let hidden = new Set();          // 범례/칩에서 끈 머신
+const shown = (m) => !hidden.has(m.machine_id);
+
+function buildSeries(machines, metric, now) {
+  const lines = [];
+  for (const m of machines) {
+    if (!shown(m)) continue;
+    const g = (m.gpus || [])[0] || {};
+    const idx = g.index;
+    const pts = (m.history || []).filter((h) => now - h.t <= rangeSec)
+      .map((h) => ({ t: h.t, v: metric.hist(h, idx) })).filter((p) => num(p.v));
+    lines.push({ id: m.machine_id, name: m.label || m.machine_id,
+                 color: colorOf.get(m.machine_id), pts,
+                 cur: metric.cur(m, g), online: m.online });
+  }
+  return { now, lines };
+}
+
+function panelHtml(metric, series, i) {
+  const legend = series.lines.map((s) => `<span class="i">
+    <span class="k" style="background:${s.color}"></span>${esc(s.name)}
+    <b class="${metric.warn ? grade(s.cur, metric.warn[0], metric.warn[1]) : ""}">${
+      esc(num(s.cur) ? metric.fmt(s.cur) : "—")}</b></span>`).join("");
+  return `<section class="panel">
+    <div class="ptitle">${esc(metric.title)}<span class="range">${esc(dur(rangeSec))}</span></div>
+    <div class="plot" data-metric="${i}"></div>
+    <div class="legend">${legend}</div>
+  </section>`;
+}
+
+function trainingRuns(m) {
+  return (m.gpus || []).filter((g) => g.run).map((g) => ({
+    gpu: g, run: (m.runs || []).find((r) => r.dir === g.run.dir) || g.run }));
+}
+
+// 예상 종료 '시각'. eta_sec 는 에이전트가 스냅샷을 찍은 시점 기준이라 보고 지연만큼 뺀다.
+// 몇 초 뒤의 시각을 'HH:MM' 으로. 오늘이 아니면 날짜를 붙인다.
+function clockAt(secFromNow) {
+  const end = new Date(Date.now() + secFromNow * 1000);
+  const hm = `${String(end.getHours()).padStart(2, "0")}:${String(end.getMinutes()).padStart(2, "0")}`;
+  return (end.toDateString() === new Date().toDateString() ? "" : `${end.getMonth() + 1}/${end.getDate()} `) + hm;
+}
+// 지금 단계 종료. eta_sec 는 에이전트가 스냅샷을 찍은 시점 기준이라 보고 지연만큼 뺀다.
+// rest 가 있으면(체인으로 예약된 남은 단계의 AI 추정 합) 체인 전체 종료도 붙인다.
+// 조각마다 span 으로 감싸 폰 폭에서는 남은 시간을 접고 '전체'를 둘째 줄로 내린다.
+function etaHtml(eta, age, rest) {
+  if (!num(eta)) return "종료 —";
+  const left = Math.max(0, eta - (num(age) ? age : 0));
+  return `<span>${esc(clockAt(left))} 종료</span><span class="eta-left"> (${esc(dur(left))})</span>`
+    + (num(rest) && rest > 0 ? `<span class="eta-all"> · 전체 ${esc(clockAt(left + rest))}</span>` : "");
+}
+
+function lossPlot(lines, width) {
+  const W = Math.max(320, width), H = 190;
+  const P = { t: 12, r: 56, b: 18, l: 52 };
+  let pts = lines.map((s) => {
+    let p = s.pts;
+    const MAX = 320;
+    if (p.length > MAX) {
+      const st = Math.ceil(p.length / MAX);
+      const thin = p.filter((_, i) => i % st === 0);
+      if (thin[thin.length - 1] !== p[p.length - 1]) thin.push(p[p.length - 1]);
+      p = thin;
+    }
+    return { ...s, pts: p };
+  });
+  const allx = pts.flatMap((s) => s.pts.map((p) => p.step));
+  const ally = pts.flatMap((s) => s.pts.map((p) => p.loss));
+  const x0 = Math.min(...allx), x1 = Math.max(...allx);
+  const dMin = Math.min(...ally), dMax = Math.max(...ally);
+  const pad = (dMax - dMin) * .08 || Math.abs(dMax) * .1 || 1;
+  const y0 = dMin - pad, y1 = dMax + pad;
+  const X = (s) => P.l + ((s - x0) / (x1 - x0 || 1)) * (W - P.l - P.r);
+  const Y = (l) => P.t + (1 - (l - y0) / (y1 - y0 || 1)) * (H - P.t - P.b);
+  const ticks = [dMin, (dMin + dMax) / 2, dMax];
+  const grid = ticks.map((t) => `
+    <line x1="${P.l}" x2="${W - P.r}" y1="${Y(t).toFixed(1)}" y2="${Y(t).toFixed(1)}"
+          stroke="var(--grid)" stroke-width="1"/>
+    <text class="axlab" x="${P.l - 5}" y="${(Y(t) + 3.5).toFixed(1)}" text-anchor="end">${esc(autoNum(t))}</text>`).join("");
+  const body = pts.map((s) => {
+    const at = s.pts.map((p) => ({ ...p, cx: X(p.step), cy: Y(p.loss) }));
+    const d = at.map((p, i) => `${i ? "L" : "M"}${p.cx.toFixed(1)} ${p.cy.toFixed(1)}`).join(" ");
+    const last = at[at.length - 1];
+    return { line: `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2"
+        stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${last.cx.toFixed(1)}" cy="${last.cy.toFixed(1)}" r="4"
+        fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`, at };
+  });
+  return { svg: `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+       aria-label="loss 곡선 ${autoNum(dMax)}에서 ${autoNum(dMin)}까지">
+    <text class="axlab" x="0" y="${P.t - 2}">loss</text>
+    ${grid}
+    <line x1="${P.l}" x2="${W - P.r}" y1="${H - P.b}" y2="${H - P.b}" stroke="var(--axis)" stroke-width="1"/>
+    ${body.map((b) => b.line).join("")}
+    <text class="axlab" x="${P.l}" y="${H - 4}">step ${esc(kstep(x0))}</text>
+    <text class="axlab" x="${W - P.r}" y="${H - 4}" text-anchor="end">${esc(kstep(x1))}</text>
+    <g class="cross" hidden><line y1="${P.t}" y2="${H - P.b}" stroke="var(--axis)" stroke-width="1"/></g>
+  </svg>`, cols: body.map((b, i) => ({ ...pts[i], at: b.at })) };
+}
+
+function bindLoss(box, cols) {
+  const svg = box.querySelector("svg");
+  if (!svg) return;
+  const cross = svg.querySelector(".cross"), cline = cross.querySelector("line");
+  const vb = svg.viewBox.baseVal;
+  svg.addEventListener("pointermove", (ev) => {
+    const b = svg.getBoundingClientRect();
+    const sx = (ev.clientX - b.left) * (vb.width / b.width);
+    let anchor = null, rows = [], step = null;
+    for (const c of cols) {
+      let best = c.at[0];
+      for (const p of c.at) if (Math.abs(p.cx - sx) < Math.abs(best.cx - sx)) best = p;
+      if (anchor === null || Math.abs(best.cx - sx) < Math.abs(anchor - sx)) { anchor = best.cx; step = best.step; }
+      rows.push({ c, p: best });
+    }
+    if (anchor === null) return;
+    cross.removeAttribute("hidden");
+    cline.setAttribute("x1", anchor); cline.setAttribute("x2", anchor);
+    showTip(ev, `<div class="hd">step ${esc(nf(step))}</div>` + rows.map(({ c, p }) =>
+      `<div class="row"><span class="k" style="background:${c.color}"></span>
+       <b>${esc(autoNum(p.loss))}</b><span>${esc(c.name)}</span></div>`).join(""));
+  });
+  svg.addEventListener("pointerleave", () => { cross.setAttribute("hidden", ""); hideTip(); });
+}
+
+// =====================================================================
+// 머신 표 — 패널이 답하지 못하는 '누가·무엇을' 을 맡는다
+// =====================================================================
+function machineTable(machines) {
+  const rows = machines.map((m) => {
+    const g = (m.gpus || [])[0] || {};
+    const training = trainingRuns(m);
+    const run = training.length ? training[0].run : null;
+    const open = openDetails.has(m.machine_id);
+    const multi = (m.gpus || []).length > 1;
+    // AI 가 식별했으면 그 이름을 쓴다(런 폴더 이름 'finetune' 보다 '무슨 실험'인지 보인다).
+    const aiOf = (gpu) => gpu && gpu.ai && gpu.ai.status === "done" ? gpu.ai : null;
+    // GPU 한 장 = 한 줄. 점유와 학습을 합쳐 '지금 무엇을 하는가' 한 줄로 쓴다.
+    const lines = ((m.gpus || []).length ? m.gpus : [{}]).map((gpu) => {
+      const t = training.find((x) => x.gpu === gpu);
+      const r = t && t.run, a = aiOf(gpu);
+      const stalled = r && r.status !== "running" && num(r.log_age_sec);
+      // 진행률이 있는 작업은 맥박 점. 학습이 아닌 작업(데이터 캡처·평가 등)은 '작업 중'으로 부른다.
+      const working = a && a.kind && a.kind !== "training";
+      // 정지 신호로 세워 둔 작업은 고장(멈춤)이 아니라 일시정지다 — 회색으로 따로 보인다.
+      const state = !m.online ? "off" : gpu.paused ? "pause"
+        : r ? (stalled ? (working ? "wstall" : "stall") : (working ? "work" : "train"))
+        : gpu.state === "free" ? "free" : gpu.state === "busy" ? "busy" : "unknown";
+      const pendingAi = gpu.ai && gpu.ai.status === "pending";
+      const what = !m.online ? `오프라인 · ${ago(m.age_sec)}`
+        : r ? (a ? a.title : r.name)
+        : a && gpu.state !== "free" ? a.title
+        : gpu.state === "free" ? "사용 가능"
+        : (gpu.state_reason || "점유") + (pendingAi ? " · AI 확인 중…" : "");
+      // 다음 작업: 체인·큐로 실제 예약된 것과 문서상 계획만 있는 것을 구분한다.
+      // count: 지금 단계 뒤에 남은 단계 수(다음 작업 포함). 2 이상이면 '외 N개'로 붙인다.
+      const next = a && a.next_short && gpu.state !== "free" ? { name: a.next_short, plan: a.next_source !== "chain",
+        count: Array.isArray(a.rest_stages) ? a.rest_stages.length : 0 } : null;
+      // 체인 전체 종료는 실제로 예약된 남은 단계가 있을 때만 — 계획은 시각을 약속하지 않는다.
+      const rest = a && a.next_source === "chain" && num(a.rest_sec) ? a.rest_sec : null;
+      const stages = a && Array.isArray(a.rest_stages) && a.rest_stages.length
+        ? "남은 단계: " + a.rest_stages.map((x) => `${x.name}${num(x.sec) ? ` ${dur(x.sec)}` : ""}`).join(" → ") : null;
+      const tip = [a && a.summary, a && a.next && `다음: ${a.next}`, r && r.dir,
+                   gpu.state_reason].filter(Boolean).join("\n");
+      const etaTip = [stages, a && a.rest_basis && `추정 근거: ${a.rest_basis}`].filter(Boolean).join("\n");
+      return { gpu, r, state, what, tip, next, rest, etaTip };
+    });
+    const STATE_TEXT = { off: "오프라인", train: "학습 중", stall: "학습 멈춤", work: "작업 중",
+                         wstall: "작업 멈춤", pause: "일시정지", busy: "점유 중",
+                         unknown: "점유 중(불명)", free: "비어있음" };
+    // 상태는 글자 대신 점 하나로 — 학습 중은 맥박, 멈춤은 주황, 비었으면 초록.
+    const dot = `<span class="sdot ${lines[0].state}" role="img" aria-label="${STATE_TEXT[lines[0].state]}"
+                   title="${STATE_TEXT[lines[0].state]}"></span>`;
+    const col = (f) => lines.map((l) => `<div>${f(l) || "&nbsp;"}</div>`).join("");
+    const prog = `
+      <td class="work">${col((l) => `<span title="${esc(l.tip)}">${multi ? `GPU${esc(l.gpu.index)} ` : ""}${esc(l.what)}${
+        l.next ? `<span class="nx${l.next.plan ? " plan" : ""}"> → ${esc(l.next.name)}${
+          l.next.count > 1 ? ` 외 ${l.next.count - 1}개` : ""}${l.next.plan ? " (계획)" : ""}</span>` : ""}</span>`)}</td>
+      <td class="p-pc">${col((l) => l.r ? esc(pct(l.r.progress_pct, 0)) : "")}</td>
+      <td class="p-bar">${col((l) => { if (!l.r) return ""; const p = l.r.progress_pct;
+        return `<div class="meter ${/stall/.test(l.state) ? "stall" : l.state === "pause" ? "idle" : ""}"><i style="width:${num(p) ? Math.min(100, p).toFixed(1) : 0}%"></i></div>`; })}</td>
+      <td class="p-eta">${col((l) => !l.r ? ""
+        : l.state === "pause" ? `<span class="sub">일시정지 · ${esc(dur(l.r.log_age_sec))}째</span>`
+        : !/stall/.test(l.state) ? `<span class="sub" title="${esc(l.etaTip)}">${etaHtml(l.gpu.run.eta_sec, m.age_sec, l.rest)}</span>`
+        // 프로세스는 GPU 를 물고 있는데 로그가 안 쌓인다 = 멈춤. 남은 시간은 계산할 수 없다.
+        : `<span class="sub stall">멈춤 · ${esc(dur(l.r.log_age_sec))}째 변화 없음</span>`)}</td>`;
+    const hw = [
+      ["GPU", esc(g.name || "—")],
+      ["VRAM", num(g.vram_total_mb) ? `${esc(gb(g.vram_total_mb, 1))}GB` : "—"],
+      ["전력", `${esc(nf(g.power_w, 0))} / ${esc(nf(g.power_limit_w, 0))}W`],
+      ["클럭", `${esc(nf(g.clock_mhz, 0))}MHz`],
+      ["팬", esc(pct(g.fan_pct))],
+      ["CPU", `${esc(nf(m.cpu && m.cpu.cores))}코어`],
+      ["RAM", esc(bytes(m.memory && m.memory.total_bytes))],
+      ...(m.disks || []).map((d) => [`디스크 ${d.path}`,
+        `${esc(pct(d.pct))} · ${esc(bytes(d.free_bytes))} 남음`]),
+      ["부팅 후", esc(dur(m.uptime_sec))],
+      ["호스트", `${esc(m.hostname || "—")} · ${esc(m.platform || "—")}`],
+      ["AI 식별", esc(aiStatusText(m.ai_status))],
+    ];
+    // loss 는 GPU 에서 학습이 돌 때만 보인다. 추론 점유나 끝난 런이면 아예 뺀다.
+    const lossPart = !training.length ? ""
+      : (run.loss_history || []).length > 1
+      ? `<h4>${esc(run.name)} · loss ${esc(autoNum(run.loss_total))}${
+           num(run.step) ? ` · step ${esc(nf(run.step))}/${esc(nf(run.max_steps))}` : ""}</h4>
+         <div class="plot" data-loss="${esc(m.machine_id)}"></div>`
+      : "";  // loss 를 남기지 않는 작업(데이터 캡처 등)은 칸 자체를 뺀다
+    return `<tr class="mrow" data-id="${esc(m.machine_id)}" tabindex="0"
+              aria-expanded="${open}"${shown(m) ? "" : ' style="opacity:.45"'}>
+      <td class="caret">${open ? "▾" : "▸"}</td>
+      <td class="who">${dot}<span class="nm"><span class="k" style="background:${colorOf.get(m.machine_id)}"></span>${
+        esc(m.label || m.machine_id)}</span></td>
+      ${prog}
+    </tr>
+    <tr class="mdet" data-id="${esc(m.machine_id)}"${open ? "" : " hidden"}><td colspan="6">
+      <dl class="kv">${hw.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join("")}</dl>
+      ${(m.gpus || []).filter(aiOf).map((x) => `<div class="aibox">
+        <h4>${multi ? `GPU${esc(x.index)} · ` : ""}${esc(x.ai.title)}<span class="sub"> · AI 식별 ${esc(ago(Date.now() / 1000 - x.ai.identified_at))}</span></h4>
+        <p>${esc(x.ai.summary || "")}</p>
+        ${x.ai.next ? `<p class="sub">다음: ${esc(x.ai.next)}</p>` : ""}
+        ${x.ai.log_path ? `<p class="sub">로그: <code>${esc(x.ai.log_path)}</code></p>` : ""}</div>`).join("")}
+      ${lossPart}
+    </td></tr>`;
+  }).join("");
+  return `<section class="panel wide">
+    <div class="ptitle">머신 ${machines.length}대</div>
+    <table class="mtab"><thead><tr>
+      <th></th><th>머신</th><th>지금 하는 일</th><th colspan="3" class="r">진행 · 종료</th>
+    </tr></thead><tbody>${rows}</tbody></table></section>`;
+}
+
+// =====================================================================
+// 경고
+// =====================================================================
+function buildAlerts(machines) {
+  const out = [];
+  for (const m of machines) {
+    const who = m.label || m.machine_id;
+    // 오프라인은 경고로 띄우지 않는다 — 머신 표의 상태 점으로 충분하다.
+    // 끊긴 머신의 마지막 수치로 다른 경고를 만들지도 않는다.
+    if (!m.online) continue;
+    // AI 식별이 안 되면 '무엇에 쓰는지'가 비게 된다. 꺼 둔 것(off)은 경고가 아니다.
+    const ai = m.ai_status;
+    if (ai && ai.state === "error")
+      out.push(["warning", `<b>${esc(who)}</b> AI 식별 안 됨 · ${esc(ai.message)}`]);
+    for (const g of m.gpus || []) {
+      if (g.temp_c >= 90) out.push(["critical", `<b>${esc(who)}</b> GPU${g.index} ${esc(nf(g.temp_c))}℃`]);
+      if (g.vram_pct >= 96) out.push(["warning", `<b>${esc(who)}</b> GPU${g.index} VRAM ${esc(pct(g.vram_pct))} · OOM 위험`]);
+      // 자동 업데이트로 드라이버 라이브러리만 바뀐 경우 등. 학습은 돌 수 있지만 지표는 비고, 새 작업이 막힐 수 있다.
+      if (g.driver_error) out.push(["warning", `<b>${esc(who)}</b> GPU${g.index} ${esc(g.driver_error)} · GPU 지표를 못 읽는다`]);
+    }
+    const ct = m.cpu && m.cpu.temp_c;
+    if (num(ct) && ct >= 90) out.push(["critical", `<b>${esc(who)}</b> CPU ${esc(nf(ct))}℃ · 스로틀링 의심`]);
+    const mem = m.memory || {};
+    if (mem.swap_total_bytes > 0 && mem.swap_used_bytes / mem.swap_total_bytes >= .97 && (mem.pct || 0) >= 75)
+      out.push(["warning", `<b>${esc(who)}</b> 스왑 고갈 + RAM ${esc(pct(mem.pct))}`]);
+    for (const d of m.disks || []) {
+      if (d.pct >= 92) out.push(["critical", `<b>${esc(who)}</b> ${esc(d.path)} ${esc(pct(d.pct))} · ${esc(bytes(d.free_bytes))} 남음`]);
+      else if (d.pct >= 85) out.push(["warning", `<b>${esc(who)}</b> ${esc(d.path)} ${esc(pct(d.pct))} 사용`]);
+    }
+    for (const r of m.runs || [])
+      if (r.status === "failed" || r.status === "error")
+        out.push(["critical", `<b>${esc(who)}</b> ${esc(r.name)} ${esc(r.status)}`]);
+    // GPU 를 문 프로세스가 그 런의 것일 때만 '멈춤'이다. 추론이 GPU 를 쓰는 동안
+    // 옛 런 로그가 조용한 것은 경고거리가 아니다.
+    for (const { gpu, run: r } of trainingRuns(m))
+      if (r.status === "idle" && r.log_age_sec > 300 && !gpu.paused)  // 일시정지는 사람이 세운 것
+        out.push(["warning", `<b>${esc(who)}</b> ${esc(r.name)} 진행이 멈췄다 · ${esc(dur(r.log_age_sec))}째 변화 없음 (GPU 는 계속 점유)`]);
+  }
+  out.sort((a, b) => (a[0] === "critical" ? 0 : 1) - (b[0] === "critical" ? 0 : 1));
+  return out;
+}
+
+const aiStatusText = (ai) => !ai ? "—"
+  : ai.state === "ok" ? `켜짐 · ${ai.message}`
+  : ai.state === "off" ? `꺼짐 · ${ai.message}`
+  : ai.state === "checking" ? "확인 중"
+  : ai.message;
+
+// 알림 칸: 한 줄 고정. 가장 급한 경고 하나 + '외 N건'(누르면 전체 목록을 겹쳐 펼친다).
+let alertsOpen = false, alertsHtml = "";
+const alertIcon = (k) => k === "critical" ? ICON.crit : ICON.warn;
+const plainText = (html) => html.replace(/<[^>]*>/g, "");
+function renderAlerts(alerts) {
+  if (alerts.length < 2) alertsOpen = false;
+  let html;
+  if (!alerts.length) html = `<div class="abar calm">${ICON.ok}<span class="msg">경고 없음</span></div>`;
+  else {
+    const [k, msg] = alerts[0], more = alerts.length - 1;
+    html = `<div class="abar ${k}">${alertIcon(k)}<span class="msg" title="${plainText(msg)}">${msg}</span>${
+      more ? `<button class="ghost amore" aria-expanded="${alertsOpen}">외 ${more}건 ${alertsOpen ? "▴" : "▾"}</button>` : ""}</div>${
+      alertsOpen ? `<div class="alist">${alerts.map(([k2, m2]) =>
+        `<div class="alert ${k2}">${alertIcon(k2)}<div>${m2}</div></div>`).join("")}</div>` : ""}`;
+  }
+  // 같은 내용이면 다시 그리지 않는다 — 펼친 목록의 스크롤이 2초마다 튀지 않게.
+  if (html !== alertsHtml) { alertsHtml = html; document.getElementById("alerts").innerHTML = html; }
+}
+function toggleAlerts(open) {
+  alertsOpen = open;
+  if (lastData) renderAlerts(buildAlerts(lastData.machines || []));
+}
+document.getElementById("alerts").addEventListener("click", (ev) => {
+  if (ev.target.closest(".amore")) toggleAlerts(!alertsOpen);
+});
+// 바깥을 누르면 닫는다. 버튼은 위 핸들러에서 이미 다시 그려져 떨어져 나갔으므로
+// target.closest 대신 눌린 순간의 경로로 판단한다.
+document.addEventListener("click", (ev) => {
+  if (alertsOpen && !ev.composedPath().includes(document.getElementById("alerts"))) toggleAlerts(false);
+});
+document.addEventListener("keydown", (ev) => {
+  if (alertsOpen && ev.key === "Escape") toggleAlerts(false);
+});
+
+// =====================================================================
+// 브라우저 탭
+// =====================================================================
+const TAB_COLORS = { hot: "#d03b3b", run: "#2a78d6", free: "#0ca30c", none: "#898781" };
+let lastIconKey = "";
+function drawFavicon(kind, p, label) {
+  const c = document.createElement("canvas"); c.width = c.height = 32;
+  const x = c.getContext("2d");
+  x.fillStyle = TAB_COLORS[kind] || TAB_COLORS.none;
+  x.beginPath(); x.arc(16, 16, 15, 0, Math.PI * 2); x.fill();
+  if (kind === "run" && num(p)) {
+    x.strokeStyle = "rgba(255,255,255,.35)"; x.lineWidth = 5;
+    x.beginPath(); x.arc(16, 16, 10, 0, Math.PI * 2); x.stroke();
+    x.strokeStyle = "#fff"; x.lineCap = "round";
+    x.beginPath(); x.arc(16, 16, 10, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, p / 100)); x.stroke();
+  } else if (label) {
+    x.fillStyle = "#fff"; x.font = "bold 21px system-ui, sans-serif";
+    x.textAlign = "center"; x.textBaseline = "middle"; x.fillText(label, 16, 17);
+  }
+  return c.toDataURL("image/png");
+}
+function renderTab(machines, alerts, freeCount, total) {
+  const hot = alerts.filter((a) => a[0] === "critical").length;
+  const running = [];
+  for (const m of machines) for (const r of m.runs || [])
+    if (r.status === "running" && num(r.progress_pct)) running.push(r);
+  running.sort((a, b) => a.progress_pct - b.progress_pct);
+  const run = running[0] || null;
+  let kind, p = null, label = "", head;
+  if (hot) { kind = "hot"; label = "!"; head = `⚠ 경고 ${hot}건`; }
+  else if (run) { kind = "run"; p = run.progress_pct;
+    head = `${p.toFixed(0)}% ${run.name}` + (running.length > 1 ? ` +${running.length - 1}` : ""); }
+  else if (freeCount) { kind = "free"; label = String(freeCount); head = `빈 GPU ${freeCount}/${total}`; }
+  else { kind = "none"; label = "0"; head = "빈 GPU 없음"; }
+  const title = `${head} · GPU 모니터`;
+  if (document.title !== title) document.title = title;
+  const key = `${kind}|${label}|${num(p) ? p.toFixed(0) : ""}`;
+  if (key !== lastIconKey) { lastIconKey = key;
+    document.getElementById("favicon").href = drawFavicon(kind, p, label); }
+}
+
+// =====================================================================
+// 렌더
+// =====================================================================
+let lastData = null;
+let restoreY = null;
+try { const y = +sessionStorage.getItem("scrollY"); if (y > 0) restoreY = y; } catch (_) {}
+if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+addEventListener("scroll", () => {
+  try { sessionStorage.setItem("scrollY", String(Math.round(window.scrollY))); } catch (_) {}
+}, { passive: true });
+const openDetails = new Set();
+
+function render(data) {
+  if (!data) return;
+  lastData = data; hideTip();
+  // 패널을 통째로 갈아 끼우는 순간 페이지가 잠깐 짧아져 브라우저가 스크롤을 맨 위로
+  // 끌어올린다. 높이를 붙잡아 두고, 다 그린 뒤 원래 위치로 되돌린다.
+  const panelsEl = document.getElementById("panels");
+  const keepY = restoreY ?? window.scrollY;
+  panelsEl.style.minHeight = panelsEl.offsetHeight + "px";
+  const machines = data.machines || [];
+  assignColors(machines);
+  const now = data.server_time;
+  const gpus = machines.flatMap((m) => m.gpus || []);
+  const freeCount = machines.filter((m) => m.online)
+    .flatMap((m) => m.gpus || []).filter((g) => g.state === "free").length;
+
+  // 필터 칩 — 한 줄, 패널 위. 아래 모든 것의 범위를 정한다.
+  document.getElementById("chips").innerHTML = machines.map((m) =>
+    `<button class="chip ${shown(m) ? "on" : "off"}" data-id="${esc(m.machine_id)}">
+       <span class="k" style="background:${colorOf.get(m.machine_id)}"></span>${esc(m.label || m.machine_id)}</button>`).join("");
+  document.getElementById("range").innerHTML = RANGES.map(([s, t]) =>
+    `<button data-sec="${s}" class="${s === rangeSec ? "on" : ""}">${t}</button>`).join("");
+
+  const alerts = buildAlerts(machines);
+  renderAlerts(alerts);
+
+  panelsEl.innerHTML =
+    machineTable(machines)
+    + METRICS.map((mt, i) => panelHtml(mt, buildSeries(machines, mt, now), i)).join("");
+  document.getElementById("empty").hidden = machines.length > 0;
+
+  // 폭을 잰 뒤 그린다 — viewBox 를 늘려 stroke 가 찌그러지는 걸 피한다.
+  for (const box of document.querySelectorAll(".plot[data-metric]")) {
+    const mt = METRICS[+box.dataset.metric];
+    const series = buildSeries(machines, mt, now);
+    box.innerHTML = plot(series, { lo: mt.lo, hi: mt.hi, width: box.clientWidth,
+      fmt: mt.fmt, thresholds: mt.thresholds || [] });
+    bindPlot(box, series, mt.fmt, (p) => p ? ago(now - p.t) : "");
+  }
+  for (const lbox of document.querySelectorAll(".plot[data-loss]")) {
+    const m = machines.find((x) => x.machine_id === lbox.dataset.loss);
+    const tr = m && trainingRuns(m)[0];
+    if (!tr) continue;
+    const run = tr.run;
+    const line = { id: m.machine_id, name: run.name, color: colorOf.get(m.machine_id),
+                   run, pts: (run.loss_history || []).filter((q) => num(q.step) && num(q.loss)) };
+    const { svg, cols } = lossPlot([line], lbox.clientWidth);
+    lbox.innerHTML = svg; bindLoss(lbox, cols);
+  }
+  panelsEl.style.minHeight = "";
+  if (Math.abs(window.scrollY - keepY) > 1) window.scrollTo(0, keepY);
+  // 브라우저 새로고침(F5) 뒤 첫 렌더에서 한 번만 복원한다 — 데이터가 늦게 와서
+  // 기본 스크롤 복원이 짧은 빈 페이지에서 이미 끝나 버리기 때문이다.
+  restoreY = null;
+
+  renderTab(machines, alerts, freeCount, gpus.length);
+}
+
+// 탭이 가려져 있으면 표·그래프는 그리지 않고 탭 제목·아이콘만 갱신한다. 2초마다 화면
+// 전체를 다시 만드는 일이 안 보이는 탭(특히 폰)에서 계속 돌 이유가 없다.
+let hiddenPending = false;
+function renderTabOnly(data) {
+  const machines = data.machines || [];
+  const freeCount = machines.filter((m) => m.online)
+    .flatMap((m) => m.gpus || []).filter((g) => g.state === "free").length;
+  renderTab(machines, buildAlerts(machines), freeCount,
+            machines.flatMap((m) => m.gpus || []).length);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && hiddenPending && lastData) { hiddenPending = false; liveRender(lastData); }
+});
+
+// 시계열 이어 붙이기. hub 는 실시간(SSE) 방송에 지난 방송 뒤 새 점만 싣는다
+// (history_mode=delta). 처음 붙을 때와 폴링(api/all)은 전체(full)를 주므로 갈아 끼운다.
+const histStore = new Map();
+function mergeHistory(data) {
+  const cap = data.history_points || 300;
+  for (const m of data.machines || []) {
+    const pts = m.history || [];
+    let s = histStore.get(m.machine_id);
+    if (data.history_mode !== "delta" || !s) s = pts.slice();
+    else {
+      const last = s.length ? s[s.length - 1].t : -Infinity;
+      for (const p of pts) if (p.t > last) s.push(p);
+      if (s.length > cap) s.splice(0, s.length - cap);
+    }
+    histStore.set(m.machine_id, s);
+    m.history = s;
+  }
+  return data;
+}
+
+// 칩·범위 클릭
+document.getElementById("chips").addEventListener("click", (ev) => {
+  const b = ev.target.closest(".chip"); if (!b) return;
+  const id = b.dataset.id;
+  if (hidden.has(id)) hidden.delete(id); else hidden.add(id);
+  render(lastData);
+});
+document.getElementById("range").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button"); if (!b) return;
+  rangeSec = +b.dataset.sec; render(lastData);
+});
+// 행 하나가 곧 펼침 버튼이다. 펼친 상태는 2 초마다 다시 그려도 유지된다.
+function toggleMachine(id) {
+  if (openDetails.has(id)) openDetails.delete(id); else openDetails.add(id);
+  render(lastData);
+  document.querySelector(`tr.mrow[data-id="${CSS.escape(id)}"]`)?.focus();
+}
+document.getElementById("panels").addEventListener("click", (ev) => {
+  const tr = ev.target.closest("tr.mrow");
+  // 행 안의 글을 드래그해 선택한 것이면 펼침 토글로 보지 않는다.
+  if (tr && !selecting()) toggleMachine(tr.dataset.id);
+});
+document.getElementById("panels").addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const tr = ev.target.closest("tr.mrow");
+  if (tr) { ev.preventDefault(); toggleMachine(tr.dataset.id); }
+});
+
+let resizeTimer = null;
+addEventListener("resize", () => { clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => render(lastData), 150); });
+
+// ---------- 테마 ----------
+const THEME_KEY = "gpumon-theme";
+function applyTheme(t) {
+  if (t) document.documentElement.dataset.theme = t;
+  else delete document.documentElement.dataset.theme;
+  if (lastData) render(lastData);
+}
+try { applyTheme(localStorage.getItem(THEME_KEY) || ""); } catch (e) {}
+document.getElementById("theme").onclick = () => {
+  const now = document.documentElement.dataset.theme || "";
+  const next = now === "dark" ? "light" : now === "light" ? "" : "dark";
+  try { next ? localStorage.setItem(THEME_KEY, next) : localStorage.removeItem(THEME_KEY); } catch (e) {}
+  applyTheme(next);
+};
+
+// ---------- 연결 ----------
+const connEl = document.getElementById("conn"), connText = document.getElementById("connText");
+// 연결 표시는 문제가 있을 때만 띄운다. 실시간(SSE)이든 2초 폴링이든 화면은 똑같이
+// 갱신되므로, 정상일 때 방식 이름을 보여줘 봐야 읽을 사람만 헷갈린다.
+function setConn(kind, text) {
+  connEl.className = "conn " + kind; connText.textContent = text || "";
+  connEl.hidden = kind !== "down";
+}
+let pollTimer = null, sse = null, sseFailures = 0;
+// 글을 드래그해 선택하는 동안 화면을 갈아 끼우면 선택 기준 노드가 사라져 선택이
+// 페이지 전체로 번진다. 마우스를 누르고 있거나 선택이 남아 있으면 실시간 갱신을
+// 붙잡아 두고, 선택이 풀리면 가장 최근 데이터로 한 번 그린다.
+let pointerHeld = false, heldData = null;
+const holdBadge = document.createElement("div");
+holdBadge.className = "hold"; holdBadge.hidden = true;
+holdBadge.textContent = "글 선택 중 · 실시간 갱신 멈춤";
+document.body.appendChild(holdBadge);
+function selecting() {
+  const sel = window.getSelection();
+  return !!sel && !sel.isCollapsed && sel.rangeCount > 0;
+}
+function liveRender(data) {
+  if (document.hidden) { lastData = data; hiddenPending = true; renderTabOnly(data); return; }
+  if (pointerHeld || selecting()) { heldData = data; holdBadge.hidden = !selecting(); return; }
+  heldData = null; holdBadge.hidden = true; render(data);
+}
+function flushHeld() {
+  if (heldData && !pointerHeld && !selecting()) liveRender(heldData);
+  else holdBadge.hidden = !(heldData && selecting());
+}
+addEventListener("pointerdown", () => { pointerHeld = true; }, true);
+addEventListener("pointerup", () => { pointerHeld = false; setTimeout(flushHeld, 0); }, true);
+addEventListener("pointercancel", () => { pointerHeld = false; flushHeld(); }, true);
+document.addEventListener("selectionchange", flushHeld);
+
+async function pollOnce() {
+  try { liveRender(mergeHistory(await (await fetch("api/all", { cache: "no-store" })).json())); setConn("ok"); }
+  catch (err) { setConn("down", "hub 연결 끊김 · 재연결 중"); }
+}
+const startPolling = () => { if (!pollTimer) { pollOnce(); pollTimer = setInterval(pollOnce, 2000); } };
+const stopPolling = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } };
+// SSE 가 열려 있는데 이만큼 조용하면 죽은 연결로 본다(노트북이 잠들었다 깨어난 뒤 등).
+// 브라우저는 이런 연결에 오류를 내지 않아서, 그대로 두면 옛 화면에 멈춘 채 정상처럼 보인다.
+// hub 는 변화가 없어도 6초마다 보낸다.
+const SSE_SILENT_MS = 20000;
+let lastSseAt = 0;
+function sseFailed() {
+  sse.close(); sseFailures++; startPolling();
+  setTimeout(connect, Math.min(30000, 1000 * 2 ** Math.min(5, sseFailures)));
+}
+function connect() {
+  try { sse = new EventSource("events"); } catch (err) { startPolling(); return; }
+  sse.onopen = () => { sseFailures = 0; lastSseAt = Date.now(); stopPolling(); setConn("ok"); };
+  sse.onmessage = (ev) => { lastSseAt = Date.now(); try { liveRender(mergeHistory(JSON.parse(ev.data))); } catch (err) {} };
+  sse.onerror = sseFailed;
+}
+setInterval(() => {
+  if (sse && sse.readyState === 1 && Date.now() - lastSseAt > SSE_SILENT_MS) sseFailed();
+}, 5000);
+pollOnce(); connect();
+</script>
+</body>
+</html>

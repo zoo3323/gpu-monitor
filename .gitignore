@@ -1,0 +1,12 @@
+# 이 머신의 설정(공유 토큰이 들어 있다). 배포본은 monitor.env.example 을 쓴다.
+monitor.env
+# 손으로 남긴 백업·옛 판
+*.bak
+*.bak-*
+*.before-*
+dashboard.html.v[0-9]*
+backup_v1_*/
+# 실행 부산물
+__pycache__/
+*.log
+*.pid
