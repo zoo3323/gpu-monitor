@@ -45,7 +45,9 @@ AI는 읽기만 합니다.
 |---|---|
 | 리눅스 | systemd 사용자 서비스로 돕니다. systemd가 없으면 cron이 1분마다 확인해 다시 띄웁니다 |
 | WSL2 | 윈도우 작업 스케줄러가 숨은 창으로 에이전트를 띄우고, 로그인해 있는 동안 5분마다 확인합니다(WSL은 창을 다 닫으면 멈춥니다). WSL2 안의 hub는 미러 네트워킹(`networkingMode=mirrored`)이어야 다른 서버에서 닿습니다 |
-| WSL 없는 윈도우 | 아직 지원하지 않습니다 — 에이전트가 리눅스 `/proc`을 읽습니다 |
+| 윈도우 | PowerShell에서 `iex (irm 'http://HUB:PORT/install.ps1?t=TOKEN')`을 실행하면 지금 사용자로 에이전트를 설치합니다(관리자 권한 불필요). 작업 스케줄러가 로그인할 때 창 없이 띄우고 5분마다 확인합니다. Python 3.7 이상이 필요합니다(`winget install -e --id Python.Python.3.12`). 이름은 먼저 `$env:GPU_MONITOR_LABEL = '이름'`으로 정합니다. hub는 리눅스나 WSL에서 돌립니다 |
+
+윈도우와 WSL2 설치는 GitHub의 윈도우 서버에서 가짜 `nvidia-smi`로 시험했습니다(그 서버에는 실제 GPU가 없습니다). 윈도우에서의 AI 식별은 아직 시험하지 않았습니다.
 
 ## 설치 옵션
 
@@ -62,10 +64,10 @@ AI는 읽기만 합니다.
 
 | 하고 싶은 것 | 방법 |
 |---|---|
-| 로그 보기 | `journalctl --user -u gpu-monitor-agent -f` (hub는 `gpu-monitor-hub`) |
+| 로그 보기 | `journalctl --user -u gpu-monitor-agent -f` (hub는 `gpu-monitor-hub`). 윈도우는 `%LOCALAPPDATA%\gpu-monitor\agent.log` |
 | 설정 바꾸기 | `monitor.env`를 고치고 `systemctl --user restart gpu-monitor-agent`. 항목: [`monitor.env.example`](../monitor.env.example) |
 | 업데이트 | hub: `git pull && ./install.sh hub`. GPU 서버: 설치 줄을 다시 실행합니다 |
-| 제거 | `./install.sh uninstall`. 한 줄로 설치한 서버는 `~/gpu-monitor/install.sh uninstall` |
+| 제거 | `./install.sh uninstall`. 한 줄로 설치한 서버는 `~/gpu-monitor/install.sh uninstall`. 윈도우는 `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\gpu-monitor\install.ps1" -Uninstall` |
 
 systemd가 없는 서버는 cron으로 1분마다 살아 있는지 확인하고 다시 띄웁니다(WSL2는 대신 윈도우 작업 스케줄러를 씁니다. 지원 환경 참고).
 로그아웃한 뒤에도 계속 돌게 하려면 `sudo loginctl enable-linger $USER`를 한 번 실행해야 할 수 있습니다(설치할 때 알려 드립니다).
@@ -85,6 +87,6 @@ systemd가 없는 서버는 cron으로 1분마다 살아 있는지 확인하고 
 | `agent.py` | GPU 서버마다 돕니다. `nvidia-smi`·`/proc`로 점유자를 찾고, AI로 식별하고, 2초마다 hub로 보냅니다 |
 | `hub.py` | 보고를 받아 대시보드로 흘려보냅니다(SSE). 설치 스크립트와 에이전트 파일도 내줍니다 |
 | `dashboard.html` | 대시보드 |
-| `install.sh` | 설치·업데이트·제거 |
+| `install.sh`, `install.ps1` | 설치·업데이트·제거 (리눅스·WSL / 윈도우) |
 | `run-agent.sh`, `run-hub.sh`, `run-tunnel.sh`, `watchdog.sh` | 서비스가 부르는 실행 스크립트(각각 하나만 돕니다) |
 | `monitor.env.example` | 설정 항목 전체 |

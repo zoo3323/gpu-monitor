@@ -1,0 +1,143 @@
+# 윈도우·WSL2 에서 실제로 설치·실행·재시작·제거해 본다. 러너에는 GPU 가 없어서
+# 가짜 nvidia-smi(ci/FakeSmi.cs)를 쓴다.
+name: Windows & WSL2 install test
+on:
+  push:
+    branches: [main]
+    paths: ['agent.py', 'hub.py', 'install.sh', 'install.ps1', 'run-*.sh', 'watchdog.sh', 'ci/**', '.github/workflows/test-windows.yml']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Fake GPUs and a hub
+        shell: pwsh
+        run: |
+          & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /out:"$env:WINDIR\nvidia-smi.exe" ci\FakeSmi.cs
+          nvidia-smi -L
+          New-Item -ItemType Directory -Force C:\fake-smi | Out-Null
+          $py = (Get-Command python).Source
+          # 러너는 단계가 끝나면 그 단계에서 띄운 프로세스를 정리한다 — WMI 로 띄워 단계 밖에 둔다.
+          function Spawn([string]$cmd) { (Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; CurrentDirectory = "$PWD" }).ProcessId }
+          Set-Content C:\fake-smi\train.py 'import time; time.sleep(1500)'
+          Set-Content C:\fake-smi\eval.py 'import time; time.sleep(1500)'
+          $a = Spawn "`"$py`" C:\fake-smi\train.py --cfg big.yaml"
+          $b = Spawn "`"$py`" C:\fake-smi\eval.py"
+          # 프로세스 a 는 GPU 두 장, b 는 GPU1 (한 GPU 에 서로 다른 작업 둘)
+          @("GPU-fake-0, $a, [N/A], $py", "GPU-fake-1, $a, [N/A], $py", "GPU-fake-1, $b, [N/A], $py") | Set-Content C:\fake-smi\apps.txt
+          Get-Content C:\fake-smi\apps.txt
+          Spawn "cmd /c `"`"$py`" hub.py --port 8787 --host 127.0.0.1 --token tt > hub.out 2> hub.err`"" | Out-Null
+          $ok = $false; foreach ($i in 1..15) { Start-Sleep 1; try { Invoke-RestMethod http://127.0.0.1:8787/api/health; $ok = $true; break } catch { } }
+          if (-not $ok) { Get-Content hub.out, hub.err -ErrorAction SilentlyContinue; throw 'hub did not start' }
+      - name: Install like a user (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          $env:GPU_MONITOR_NOAI = '1'; $env:GPU_MONITOR_LABEL = 'win-ci'
+          iex (irm 'http://127.0.0.1:8787/install.ps1?t=tt')
+          if (-not (Get-ScheduledTask -TaskName gpu-monitor-agent -ErrorAction SilentlyContinue)) { throw 'no task' }
+      - name: Check what the hub sees
+        shell: pwsh
+        run: python ci/check.py win-ci windows --gpus 2 --jobs "0,1:1;1:1"
+      - name: Task details
+        if: always()
+        shell: pwsh
+        run: |
+          $t = Get-ScheduledTask -TaskName gpu-monitor-agent -ErrorAction SilentlyContinue
+          if ($t) { $t.Triggers | Format-List *; $t.Settings | Format-List MultipleInstances, ExecutionTimeLimit; $t.Principal | Format-List *; Get-ScheduledTaskInfo -TaskName gpu-monitor-agent | Format-List * }
+          Get-Content "$env:LOCALAPPDATA\gpu-monitor\agent.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+          Get-Content "$env:LOCALAPPDATA\gpu-monitor\monitor.env" -ErrorAction SilentlyContinue | Where-Object { $_ -notlike 'MONITOR_TOKEN*' }
+      - name: A second copy exits, a killed agent comes back
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\gpu-monitor"
+          $py = (Get-Command python).Source
+          $second = & $py "$dir\agent.py" 2>&1 | Out-String
+          Write-Host "second copy: $second"
+          Get-CimInstance Win32_Process -Filter "Name like 'python%'" | Where-Object { $_.CommandLine -like "*gpu-monitor\agent.py*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+          Start-Sleep 15
+          python ci/check.py win-ci windows --offline --wait 30
+          Start-ScheduledTask -TaskName gpu-monitor-agent
+          python ci/check.py win-ci windows --gpus 2 --jobs "0,1:1;1:1"
+      - name: Uninstall
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\gpu-monitor\install.ps1" -Uninstall
+          if (Get-ScheduledTask -TaskName gpu-monitor-agent -ErrorAction SilentlyContinue) { throw 'task still there' }
+          Start-Sleep 15
+          python ci/check.py win-ci windows --offline --wait 30
+
+  wsl:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        systemd: ['true', 'false']
+    env:
+      # systemd 를 켠 WSL 은 WSL 을 깨워 두는 작업, 끈 WSL 은 에이전트를 직접 띄우는 작업이 생긴다.
+      TASK: ${{ matrix.systemd == 'true' && 'gpu-monitor-keepalive' || 'gpu-monitor-agent' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: python3 curl
+      - name: systemd ${{ matrix.systemd }}
+        shell: pwsh
+        run: |
+          wsl -d Ubuntu-22.04 -u root -- bash -c "printf '[boot]\nsystemd=${{ matrix.systemd }}\n' > /etc/wsl.conf; cat /etc/wsl.conf"
+          wsl --shutdown
+          Start-Sleep 3
+          wsl -d Ubuntu-22.04 -- bash -c 'ps -p 1 -o comm='
+      - name: Hub on the Windows side
+        shell: pwsh
+        run: |
+          $py = (Get-Command python).Source
+          # 같은 PC 의 WSL2 에서 오는 연결은 윈도우 방화벽이 막는다 — 다른 서버의 hub 처럼 열어 둔다.
+          New-NetFirewallRule -DisplayName gpu-monitor-hub -Direction Inbound -Protocol TCP -LocalPort 8787 -Action Allow | Out-Null
+          (Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "cmd /c `"`"$py`" hub.py --port 8787 --host 0.0.0.0 --token tt > hub.out 2> hub.err`""; CurrentDirectory = "$PWD" }).ProcessId
+          $ok = $false; foreach ($i in 1..15) { Start-Sleep 1; try { Invoke-RestMethod http://127.0.0.1:8787/api/health; $ok = $true; break } catch { } }
+          if (-not $ok) { Get-Content hub.out, hub.err -ErrorAction SilentlyContinue; throw 'hub did not start' }
+      - name: Install inside WSL like a user
+        shell: wsl-bash {0}
+        run: |
+          cat /proc/version; id -un; echo "distro=$WSL_DISTRO_NAME"; ps -p 1 -o comm=
+          # WSL2 의 127.0.0.1 은 WSL 자신이다 — 윈도우(hub)는 기본 게이트웨이 주소로 닿는다.
+          HOST=$(ip route show default | awk '{print $3; exit}')
+          echo "windows host: $HOST"
+          curl -fsSL --noproxy '*' --max-time 20 "http://$HOST:8787/install.sh?t=tt" | bash -s -- --label wsl-ci --no-ai
+      - name: Check after the WSL shell closed
+        shell: pwsh
+        run: |
+          Start-Sleep 10
+          python ci/check.py wsl-ci WSL2
+          schtasks /Query /TN $env:TASK /V /FO LIST
+      - name: Shut WSL down, the Windows task brings it back
+        shell: pwsh
+        run: |
+          wsl --shutdown
+          python ci/check.py wsl-ci WSL2 --offline --wait 40
+          schtasks /Run /TN $env:TASK
+          python ci/check.py wsl-ci WSL2 --wait 90
+      - name: Uninstall
+        shell: wsl-bash {0}
+        run: |
+          ~/gpu-monitor/install.sh uninstall
+      - name: Logs
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Content hub.err -ErrorAction SilentlyContinue | Select-Object -Last 20
+          wsl -d Ubuntu-22.04 -- bash -c 'systemctl --user status gpu-monitor-agent --no-pager 2>&1 | head -12; tail -n 30 ~/gpu-monitor/agent.log 2>/dev/null; grep -v TOKEN ~/gpu-monitor/monitor.env 2>/dev/null; true'
+          exit 0

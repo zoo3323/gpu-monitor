@@ -28,8 +28,8 @@ import glob
 import json
 import math
 import os
-import pwd
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -38,6 +38,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+try:
+    import pwd
+except ImportError:  # 윈도우
+    pwd = None
+
+WINDOWS = os.name == "nt"
+# 윈도우에서 창 없이(pythonw) 돌 때 nvidia-smi·powershell·claude 가 콘솔 창을 띄우지 않게 한다.
+NOWIN = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if WINDOWS else {}
 
 AGENT_VERSION = "2.14.0"
 
@@ -224,6 +233,68 @@ def read_token(explicit, config_file=CONFIG_FILE):
     return ""
 
 
+def load_env_file(path=CONFIG_FILE):
+    """monitor.env 를 환경에 올린다(이미 있는 값은 그대로 둔다).
+
+    리눅스는 run-agent.sh 가 해 주지만, 윈도우의 pythonw 처럼 셸 없이 바로 띄워도
+    같은 설정으로 돌게 한다.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) or key in os.environ:
+            continue
+        try:
+            parts = shlex.split(value, comments=True)
+            value = " ".join(parts)
+        except ValueError:
+            value = value.strip().strip("'\"")
+        os.environ[key] = value
+
+
+def redirect_logs():
+    """창 없이(pythonw) 돌면 stdout 이 없다 — 로그를 agent.log 로 보낸다(5MB 넘으면 갈아 끼운다)."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    path = os.path.join(os.path.dirname(CONFIG_FILE), "agent.log")
+    try:
+        if os.path.getsize(path) > 5 * 1024 * 1024:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    fh = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115 — 프로세스 끝까지 쓴다
+    sys.stdout = sys.stderr = fh
+
+
+_LOCK_FH = None
+
+
+def single_instance():
+    """윈도우: 이미 돌고 있으면 False. 작업 스케줄러가 겹쳐 띄워도 하나만 돈다.
+    리눅스는 run-agent.sh 의 flock 이 맡는다."""
+    global _LOCK_FH
+    if not WINDOWS:
+        return True
+    import msvcrt
+    fh = open(os.path.join(os.path.dirname(CONFIG_FILE), ".agent.lock"), "a+")  # noqa: SIM115
+    fh.seek(0)
+    try:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        fh.close()
+        return False
+    _LOCK_FH = fh
+    return True
+
+
 def safe(fn, default=None):
     """수집기 하나가 깨져도 에이전트 전체가 죽지 않게 한다."""
     try:
@@ -234,7 +305,7 @@ def safe(fn, default=None):
 
 def run_cmd(args, timeout=5.0):
     out = subprocess.run(
-        args, capture_output=True, text=True, timeout=timeout, check=False
+        args, capture_output=True, text=True, timeout=timeout, check=False, **NOWIN
     )
     if out.returncode != 0:
         # nvidia-smi 는 오류를 stdout 에 쓰기도 한다(NVML 초기화 실패 등).
@@ -424,6 +495,8 @@ def uid_name(uid):
     if uid in _USER_CACHE:
         return _USER_CACHE[uid]
     try:
+        if pwd is None:
+            return None
         name = pwd.getpwuid(uid).pw_name
     except (KeyError, OSError):
         name = str(uid)
@@ -445,9 +518,9 @@ def command_label(comm, cmdline):
     `python3` 만 보여주면 GPU 를 뭐가 물고 있는지 알 수 없다. 프로젝트를 몰라도
     정체가 드러나게 실제 스크립트·모듈 이름까지 붙인다.
     """
-    tokens = [t for t in (cmdline or "").split() if t]
-    base = comm or (os.path.basename(tokens[0]) if tokens else "?")
-    if not tokens or not _LAUNCHERS.match(os.path.basename(tokens[0])):
+    tokens = [t.strip('"') for t in (cmdline or "").split() if t.strip('"')]
+    base = comm or (_exe_name(tokens[0]) if tokens else "?")
+    if not tokens or not _LAUNCHERS.match(_exe_name(tokens[0])):
         return base
     # `-m pkg.mod` 는 모듈 경로가 가장 정확한 이름이다.
     if "-m" in tokens:
@@ -457,10 +530,89 @@ def command_label(comm, cmdline):
     for token in tokens[1:]:
         if token.startswith("-"):
             continue
-        name = os.path.basename(token)
+        name = _exe_name(token)
         if name and name != base and not _LAUNCHERS.match(name):
             return f"{base} {name}"
     return base
+
+
+def _exe_name(path):
+    """경로의 마지막 이름. 윈도우 경로(\\)와 .exe 도 다룬다."""
+    name = re.split(r"[\\/]", path)[-1]
+    return name[:-4] if name.lower().endswith(".exe") else name
+
+
+class WinProcs:
+    """윈도우 프로세스 표(pid → 부모·이름·명령줄·시작 시각).
+
+    /proc 이 없으니 CIM(Win32_Process)으로 읽는다. 한 번에 1초 가까이 걸려서 몇 초에
+    한 번만 통째로 읽고, 소유자(사용자 이름)는 GPU 를 쓰는 프로세스만 따로 묻는다.
+    """
+    TTL = 8.0
+
+    def __init__(self):
+        self.at = -1e9
+        self.table: dict[int, dict] = {}
+        self.owners: dict[tuple, str | None] = {}
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _ps(script, timeout=30):
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" + script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False, **NOWIN)
+        return out.stdout or ""
+
+    def get(self):
+        with self.lock:
+            if time.monotonic() - self.at >= self.TTL:
+                self.at = time.monotonic()
+                try:
+                    rows = json.loads(self._ps(
+                        "Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{"
+                        "p=$_.ProcessId; pp=$_.ParentProcessId; n=$_.Name; c=$_.CommandLine; "
+                        "t=$(if ($_.CreationDate) { [int64](($_.CreationDate.ToUniversalTime() - "
+                        "[datetime]'1970-01-01').TotalSeconds) } else { 0 }) } } | ConvertTo-Json -Compress")
+                        or "[]")
+                    rows = [rows] if isinstance(rows, dict) else rows
+                    self.table = {int(r["p"]): r for r in rows if isinstance(r, dict) and r.get("p") is not None}
+                except (ValueError, OSError, subprocess.TimeoutExpired):
+                    pass
+            return self.table
+
+    def owner(self, pid, created):
+        key = (pid, created)
+        if key not in self.owners:
+            try:
+                self.owners[key] = self._ps(
+                    f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; "
+                    "if ($p) { (Invoke-CimMethod -InputObject $p -MethodName GetOwner).User }",
+                    timeout=15).strip() or None
+            except (OSError, subprocess.TimeoutExpired):
+                self.owners[key] = None
+        return self.owners[key]
+
+
+_WIN = WinProcs() if WINDOWS else None
+
+
+def win_proc_info(pid):
+    row = _WIN.get().get(int(pid))
+    if row is None:
+        return None
+    cmdline = (row.get("c") or row.get("n") or "")[:600]
+    comm = _exe_name(row.get("n") or "")
+    created = row.get("t") or 0
+    return {
+        "pid": int(pid), "cmdline": cmdline, "comm": comm, "name": command_label(comm, cmdline),
+        "ppid": row.get("pp"), "pgid": None, "state": "R",
+        # 시작 시각(초)이 pid 재사용을 가른다 — 리눅스의 start_ticks 자리.
+        "start_ticks": created, "started_at": created or None,
+        "elapsed_sec": (time.time() - created) if created else None,
+        "user": _WIN.owner(int(pid), created),
+    }
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
@@ -469,6 +621,8 @@ _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 def proc_info(pid, boot_time=None):
     """/proc 에서 프로세스 한 개를 읽는다. 못 읽으면 None."""
+    if WINDOWS:
+        return win_proc_info(pid)
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as fh:
             cmdline = fh.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
@@ -661,7 +815,7 @@ def collect_gpu_processes(minor_to_bus, fd_scan=True):
             by_pid[pid] = found
 
     scan_truncated = False
-    if fd_scan:
+    if fd_scan and not WINDOWS:
         scanned, scan_truncated = safe(
             lambda: scan_gpu_device_users_cached(minor_to_bus, boot_time), ([], False))
         for info in scanned or []:
@@ -817,6 +971,9 @@ DIST_ENV_KEYS = (b"WORLD_SIZE", b"MASTER_ADDR", b"MASTER_PORT", b"TORCHELASTIC_R
 
 def proc_stat(pid):
     """(ppid, comm). 못 읽으면 None."""
+    if WINDOWS:
+        row = _WIN.get().get(int(pid))
+        return (int(row.get("pp") or 0), _exe_name(row.get("n") or "")) if row else None
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
             raw = fh.read()
@@ -827,6 +984,8 @@ def proc_stat(pid):
 
 def dist_key(pid):
     """(환경을 읽었나, 분산 학습 표식 또는 None). 표식 말고는 환경을 밖으로 내지 않는다."""
+    if WINDOWS:
+        return False, None  # 남의 프로세스 환경을 읽을 길이 없다
     try:
         with open(f"/proc/{pid}/environ", "rb") as fh:
             raw = fh.read()
@@ -981,15 +1140,18 @@ class CpuSampler:
         self._prev = None
 
     def read(self):
-        with open("/proc/stat", "r", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("cpu "):
-                    values = [float(v) for v in line.split()[1:]]
-                    break
-            else:
-                return None
-        idle = values[3] + (values[4] if len(values) > 4 else 0.0)
-        total = sum(values)
+        if WINDOWS:
+            idle, total = win_cpu_times()
+        else:
+            with open("/proc/stat", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("cpu "):
+                        values = [float(v) for v in line.split()[1:]]
+                        break
+                else:
+                    return None
+            idle = values[3] + (values[4] if len(values) > 4 else 0.0)
+            total = sum(values)
         prev, self._prev = self._prev, (total, idle)
         if prev is None:
             return None
@@ -1067,7 +1229,7 @@ class CpuTemp:
             time.sleep(wait)
 
     def _probe(self):
-        return self._from_windows() if self.wsl else self._from_sysfs()
+        return self._from_windows() if (self.wsl or WINDOWS) else self._from_sysfs()
 
     def read(self):
         with self._lock:
@@ -1115,7 +1277,7 @@ class CpuTemp:
             try:
                 out = subprocess.run(
                     [exe, "-NoProfile", "-Command", script],
-                    capture_output=True, text=True, timeout=6.0, check=False, env=env,
+                    capture_output=True, text=True, timeout=6.0, check=False, env=env, **NOWIN,
                 )
             except (OSError, subprocess.TimeoutExpired):
                 continue
@@ -1129,6 +1291,8 @@ class CpuTemp:
 
 
 def collect_memory():
+    if WINDOWS:
+        return win_memory()
     info = {}
     with open("/proc/meminfo", "r", encoding="utf-8") as fh:
         for line in fh:
@@ -1146,6 +1310,59 @@ def collect_memory():
         "swap_total_bytes": swap_total,
         "swap_used_bytes": swap_total - swap_free,
     }
+
+
+def win_cpu_times():
+    """(유휴, 전체) 100ns 단위. kernel 시간에 유휴가 들어 있다."""
+    import ctypes
+    from ctypes import wintypes
+    idle, kernel, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+    ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user))
+    val = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime  # noqa: E731
+    return float(val(idle)), float(val(kernel) + val(user))
+
+
+def win_memory():
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    st = MemoryStatus()
+    st.dwLength = ctypes.sizeof(MemoryStatus)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+    total, available = float(st.ullTotalPhys), float(st.ullAvailPhys)
+    return {
+        "total_bytes": total, "used_bytes": total - available, "available_bytes": available,
+        "pct": (total - available) / total * 100.0 if total else None,
+        # 윈도우의 페이지 파일은 리눅스 스왑과 뜻이 달라 스왑 경고에 쓰지 않는다.
+        "swap_total_bytes": 0.0, "swap_used_bytes": 0.0,
+    }
+
+
+def win_fixed_drives():
+    """고정 디스크 드라이브(C:\\ 등)를 큰 것부터."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    mask = kernel32.GetLogicalDrives()
+    found = []
+    for i in range(26):
+        if not mask & (1 << i):
+            continue
+        root = f"{chr(65 + i)}:\\"
+        if kernel32.GetDriveTypeW(root) != 3:  # DRIVE_FIXED
+            continue
+        try:
+            total = shutil.disk_usage(root).total
+        except OSError:
+            continue
+        if total >= MIN_AUTO_DISK_BYTES:
+            found.append((root, total))
+    return [root for root, _ in sorted(found, key=lambda item: -item[1])[:MAX_AUTO_DISKS]]
 
 
 def pick_mounts(lines, size_of):
@@ -1185,6 +1402,8 @@ def default_disk_paths():
     경로를 박아두면 그 머신에서만 맞는다. 실제 블록 디바이스(와 WSL2 의
     Windows 드라이브)만 골라 큰 것부터 몇 개 본다.
     """
+    if WINDOWS:
+        return win_fixed_drives() or [os.path.expanduser("~")]
     try:
         with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
@@ -1219,6 +1438,11 @@ def collect_disks(paths):
 
 
 def collect_uptime():
+    if WINDOWS:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        return kernel32.GetTickCount64() / 1000.0
     with open("/proc/uptime", "r", encoding="utf-8") as fh:
         return float(fh.read().split()[0])
 
@@ -1664,7 +1888,8 @@ def process_paths(proc):
     if cwd:
         paths.append(cwd)
     for token in (proc.get("cmdline") or "").split():
-        if token.startswith("/"):
+        token = token.strip('"')
+        if token.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", token):
             paths.append(token)
         if token.endswith(".json"):
             full = os.path.join(cwd, token) if cwd and not token.startswith("/") else token
@@ -1814,7 +2039,8 @@ AI_STATUS_RETRY_SEC = 30.0
 AI_REDO_COOLDOWN_SEC = 60.0
 # systemd 서비스는 로그인 셸의 PATH 를 못 받는다. 흔한 설치 위치를 직접 본다.
 CLAUDE_CANDIDATES = ("~/.local/bin/claude", "~/.claude/local/claude", "/usr/local/bin/claude",
-                     "/opt/homebrew/bin/claude", "~/.npm-global/bin/claude", "/usr/bin/claude")
+                     "/opt/homebrew/bin/claude", "~/.npm-global/bin/claude", "/usr/bin/claude",
+                     "~/.local/bin/claude.exe", "~/AppData/Roaming/npm/claude.cmd")
 
 
 def find_claude(hint=None):
@@ -1889,6 +2115,9 @@ AI_LANG = {
 
 
 def _read_cmdline(pid):
+    if WINDOWS:
+        row = _WIN.get().get(int(pid))
+        return (row.get("c") or row.get("n")) if row else None
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as fh:
             return fh.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
@@ -1898,6 +2127,16 @@ def _read_cmdline(pid):
 
 def _parent_chain(pid, depth=4):
     chain = []
+    if WINDOWS:
+        for _ in range(depth):
+            st = proc_stat(pid)
+            if not st or st[0] <= 4:  # 0 System Idle, 4 System
+                break
+            pid = st[0]
+            cmd = _read_cmdline(pid)
+            if cmd:
+                chain.append(f"pid {pid}: {cmd[:400]}")
+        return chain
     for _ in range(depth):
         try:
             with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as fh:
@@ -2031,7 +2270,7 @@ class AiIdentifier:
         if self._extra_flags is not None:
             return self._extra_flags
         out = subprocess.run([self.command, "--help"], capture_output=True, text=True,
-                             timeout=30, stdin=subprocess.DEVNULL)
+                             timeout=30, stdin=subprocess.DEVNULL, **NOWIN)
         text = out.stdout + out.stderr
         if "--permission-mode" not in text or "dontAsk" not in text:
             raise RuntimeError(T("ai_too_old"))
@@ -2089,7 +2328,7 @@ class AiIdentifier:
                 else:
                     out = subprocess.run([command, "auth", "status", "--json"], capture_output=True,
                                          text=True, timeout=30, stdin=subprocess.DEVNULL,
-                                         env=self._env())
+                                         env=self._env(), **NOWIN)
                     try:
                         info = json.loads(out.stdout)
                     except ValueError:
@@ -2187,7 +2426,7 @@ class AiIdentifier:
                 cwd=leader.get("cwd") if leader.get("cwd") and os.path.isdir(leader["cwd"])
                 else os.path.expanduser("~"),
                 stdin=subprocess.DEVNULL,
-                env=self._env())
+                env=self._env(), **NOWIN)
             try:
                 outer = json.loads(proc.stdout)
             except ValueError:
@@ -2437,7 +2676,7 @@ def build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus):
         "label": args.label,
         "hostname": socket.gethostname(),
         "time": now,
-        "platform": "WSL2" if wsl else "linux",
+        "platform": "windows" if WINDOWS else ("WSL2" if wsl else "linux"),
         "cpu": {
             "cores": os.cpu_count(),
             "util_pct": cpu_sampler.read(),
@@ -2544,10 +2783,17 @@ def handle_commands(args, commands):
 
 
 def main():
+    load_env_file()
+    redirect_logs()
+    # 윈도우에서 출력을 파일로 돌리면 기본 인코딩(cp1252 등)이 한글을 못 써서 죽는다.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hub", required=True,
-                        help="예: http://HOST:8787 — 쉼표로 여러 개를 주면 닿는 쪽으로 보낸다")
-    parser.add_argument("--label", required=True, help="화면에 표시할 이름 (예: gpu-a)")
+    parser.add_argument("--hub", default=os.environ.get("MONITOR_HUB") or None,
+                        help="예: http://HOST:8787 — 쉼표로 여러 개를 주면 닿는 쪽으로 보낸다 (기본: $MONITOR_HUB)")
+    parser.add_argument("--label", default=os.environ.get("MONITOR_LABEL") or socket.gethostname().split(".")[0],
+                        help="화면에 표시할 이름 (기본: $MONITOR_LABEL, 없으면 hostname)")
     parser.add_argument("--id", help="머신 고유 id (기본: label)")
     parser.add_argument("--token", default="",
                         help="hub 와 맞춰야 하는 공유 토큰 "
@@ -2589,6 +2835,18 @@ def main():
     parser.add_argument("--once", action="store_true", help="한 번만 수집해 출력(디버그)")
     args = parser.parse_args()
 
+    if not args.hub:
+        parser.error("hub 주소가 없다: --hub 또는 monitor.env 의 MONITOR_HUB")
+    # 셸 없이 떴을 때(윈도우)도 monitor.env 의 감시 글롭·디스크·메모를 쓴다.
+    if not args.watch and os.environ.get("MONITOR_WATCH"):
+        args.watch = [p for p in os.environ["MONITOR_WATCH"].split(os.pathsep) if p]
+    if not args.disk and os.environ.get("MONITOR_DISK"):
+        args.disk = [p for p in os.environ["MONITOR_DISK"].split(os.pathsep) if p]
+    if not args.note:
+        args.note = os.environ.get("MONITOR_NOTE") or None
+    if not args.once and not single_instance():
+        print("[agent] 이미 돌고 있다 — 끝낸다", flush=True)
+        return 0
     args.id = args.id or args.label
     args.token = read_token(args.token)
     args.run_log = args.run_log or list(RUN_LOG_NAMES)
@@ -2619,7 +2877,7 @@ def main():
         return 0
 
     print(f"[agent] {args.label} -> {args.hub}  interval={args.interval}s "
-          f"platform={'WSL2' if wsl else 'linux'} "
+          f"platform={'windows' if WINDOWS else ('WSL2' if wsl else 'linux')} "
           f"disks={','.join(args.disk)} watch={len(args.watch)} "
           f"token={'설정됨' if args.token else '없음'} "
           f"ai={args.ai_mode}/{args.ai_auth}", flush=True)

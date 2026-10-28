@@ -45,7 +45,9 @@ The agent pushes to the hub every 2 s over plain HTTP, so a server behind NAT on
 |---|---|
 | Linux | systemd user services; without systemd, cron restarts it every minute |
 | WSL2 | Windows Task Scheduler starts the agent in a hidden window and checks it every 5 min while you're logged in (WSL stops when its windows close). A hub inside WSL2 is reachable from other machines only with mirrored networking (`networkingMode=mirrored`) |
-| Windows without WSL | Not supported yet — the agent reads Linux `/proc` |
+| Windows | `iex (irm 'http://HUB:PORT/install.ps1?t=TOKEN')` in PowerShell installs the agent for the current user (no admin). Task Scheduler starts it without a window at logon and checks it every 5 min. Needs Python 3.7+ (`winget install -e --id Python.Python.3.12`). Name it first with `$env:GPU_MONITOR_LABEL = 'NAME'`. The hub itself runs on Linux or WSL |
+
+Windows and WSL2 installs are tested on GitHub's Windows Server runners with a stand-in `nvidia-smi` (no real GPU there). AI identification on Windows hasn't been tested yet.
 
 ## Install options
 
@@ -62,10 +64,10 @@ The agent pushes to the hub every 2 s over plain HTTP, so a server behind NAT on
 
 | Task | How |
 |---|---|
-| Logs | `journalctl --user -u gpu-monitor-agent -f` (hub: `gpu-monitor-hub`) |
+| Logs | `journalctl --user -u gpu-monitor-agent -f` (hub: `gpu-monitor-hub`). Windows: `%LOCALAPPDATA%\gpu-monitor\agent.log` |
 | Change settings | Edit `monitor.env`, then `systemctl --user restart gpu-monitor-agent`. Options: [`monitor.env.example`](../monitor.env.example) |
 | Update | Hub: `git pull && ./install.sh hub`. GPU servers: run the install line again |
-| Uninstall | `./install.sh uninstall`. One-line installs: `~/gpu-monitor/install.sh uninstall` |
+| Uninstall | `./install.sh uninstall`. One-line installs: `~/gpu-monitor/install.sh uninstall`. Windows: `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\gpu-monitor\install.ps1" -Uninstall` |
 
 Without systemd, cron checks every minute and restarts the agent (WSL2 uses Windows Task Scheduler instead, see Platforms).
 To keep it running after you log out, you may need `sudo loginctl enable-linger $USER` once (the installer tells you).
@@ -85,6 +87,6 @@ To keep it running after you log out, you may need `sudo loginctl enable-linger 
 | `agent.py` | Runs on each GPU server. Finds GPU processes via `nvidia-smi` and `/proc`, identifies them with AI, pushes to the hub every 2 s |
 | `hub.py` | Collects reports and streams them to the dashboard (SSE). Also serves the installer and agent files |
 | `dashboard.html` | The dashboard |
-| `install.sh` | Install, update, uninstall |
+| `install.sh`, `install.ps1` | Install, update, uninstall (Linux·WSL / Windows) |
 | `run-agent.sh`, `run-hub.sh`, `run-tunnel.sh`, `watchdog.sh` | Launch scripts used by the services (only one copy of each runs) |
 | `monitor.env.example` | All settings |

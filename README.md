@@ -26,7 +26,11 @@ git clone https://github.com/zoo3323/gpu-monitor.git && cd gpu-monitor
 curl -fsSL --noproxy '*' "http://HUB:PORT/install.sh?t=TOKEN" | bash
 ```
 
-<sub>Reaches the hub only over SSH? <code>./install.sh agent --ssh you@hub --token TOKEN</code> keeps a tunnel up · Linux and WSL2</sub>
+```powershell
+iex (irm 'http://HUB:PORT/install.ps1?t=TOKEN')   # Windows, no WSL needed
+```
+
+<sub>Reaches the hub only over SSH? <code>./install.sh agent --ssh you@hub --token TOKEN</code> keeps a tunnel up</sub>
 
 **3. Job names by AI** — once per server
 
@@ -48,4 +52,4 @@ claude auth login
   </tr>
 </table>
 
-<sub>Linux + NVIDIA · Python 3.7+ · <a href="https://claude.com/claude-code">Claude Code</a> for job names (optional) · English / 한국어 · <a href="docs/DETAILS.md">Details</a> · MIT</sub>
+<sub>NVIDIA · Linux · WSL2 · Windows · Python 3.7+ · <a href="https://claude.com/claude-code">Claude Code</a> for job names (optional) · English / 한국어 · <a href="docs/DETAILS.md">Details</a> · MIT</sub>

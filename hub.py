@@ -33,7 +33,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DASHBOARD = os.path.join(HERE, "dashboard.html")
 # GPU 서버에서 한 줄로 에이전트를 깔 때 install.sh 가 hub 에서 받아 가는 파일들.
 INSTALL_SH = os.path.join(HERE, "install.sh")
-DIST_FILES = ("agent.py", "run-agent.sh", "run-tunnel.sh", "watchdog.sh", "install.sh")
+INSTALL_PS1 = os.path.join(HERE, "install.ps1")
+DIST_FILES = ("agent.py", "run-agent.sh", "run-tunnel.sh", "watchdog.sh", "install.sh", "install.ps1")
 # 화면 언어(en 기본 | ko). 대시보드의 기본 언어가 되고, 설치 한 줄로 붙는 에이전트에도 전해진다.
 LANG = os.environ.get("MONITOR_LANG") if os.environ.get("MONITOR_LANG") in ("en", "ko") else "en"
 
@@ -353,8 +354,14 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_dashboard()
         elif path == "/install.sh":
             self._serve_install(query)
+        elif path == "/install.ps1":
+            self._serve_install(query, windows=True)
         elif path.startswith("/dist/") and path[len("/dist/"):] in DIST_FILES:
-            self._serve_file(os.path.join(HERE, path[len("/dist/"):]), "text/plain; charset=utf-8")
+            name = path[len("/dist/"):]
+            # 윈도우에서 받은 저장소는 줄바꿈이 CRLF 일 수 있다. 리눅스·WSL 의 bash 는 CRLF
+            # 스크립트를 못 돌리므로 .sh·.py 는 LF 로 내준다.
+            self._serve_file(os.path.join(HERE, name), "text/plain; charset=utf-8",
+                             lf=name.endswith((".sh", ".py")))
         elif path == "/api/all":
             self._send(200, json.dumps(self.store.render(), ensure_ascii=False))
         elif path == "/api/health":
@@ -370,44 +377,56 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
-    def _serve_install(self, query):
-        """에이전트 설치 스크립트. 이 hub 의 주소와 토큰을 채워서 내준다.
+    def _serve_install(self, query, windows=False):
+        """에이전트 설치 스크립트(리눅스·WSL 은 install.sh, 윈도우는 install.ps1).
+        이 hub 의 주소·토큰·언어를 채워서 내준다.
 
         토큰을 맞게 준 요청에만 내준다 — 아니면 이 주소에 닿는 누구나 토큰을 얻는다.
+        거절도 200 + 오류를 알리는 스크립트로 준다. curl -f 는 4xx 본문을 버려서
+        사용자가 이유를 못 본다.
         """
-        # 거절도 200 + 오류를 알리는 스크립트로 준다. curl -f 는 4xx 본문을 버려서
-        # 사용자가 이유를 못 본다.
-        shell = "text/x-shellscript; charset=utf-8"
+        if windows:
+            content_type = "text/plain; charset=utf-8"
+            quote = lambda v: "'" + v.replace("'", "''") + "'"  # noqa: E731
+            fail = lambda m: f"Write-Host {quote(m)} -ForegroundColor Red\n"  # noqa: E731
+            path, marks = INSTALL_PS1, ("$ServedHub = ''", "$ServedToken = ''", "$ServedLang = ''")
+            fill = lambda k, v: f"${k} = {quote(v)}"  # noqa: E731
+        else:
+            content_type = "text/x-shellscript; charset=utf-8"
+            quote = shlex.quote
+            fail = lambda m: f"echo {shlex.quote(m)} >&2; exit 1\n"  # noqa: E731
+            path, marks = INSTALL_SH, ('SERVED_HUB=""', 'SERVED_TOKEN=""', 'SERVED_LANG=""')
+            fill = lambda k, v: f"{k}={quote(v)}"  # noqa: E731
         given = (parse_qs(query).get("t") or [""])[0]
         if self.store.token and not hmac.compare_digest(given, self.store.token):
-            msg = say("Wrong token — paste the exact line that ./install.sh hub printed on the hub server",
-                      "토큰이 맞지 않습니다 — hub 서버에서 ./install.sh hub 가 알려 준 줄을 그대로 붙여 넣으세요")
-            self._send(200, f"echo {shlex.quote(msg)} >&2; exit 1\n", shell)
+            self._send(200, fail(say("Wrong token — paste the exact line that ./install.sh hub printed on the hub server",
+                                     "토큰이 맞지 않습니다 — hub 서버에서 ./install.sh hub 가 알려 준 줄을 그대로 붙여 넣으세요")),
+                       content_type)
             return
         host = self.headers.get("Host") or ""
         if not re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{1,255}", host):
-            msg = say("Bad Host header", "Host 헤더가 올바르지 않습니다")
-            self._send(200, f"echo {shlex.quote(msg)} >&2; exit 1\n", shell)
+            self._send(200, fail(say("Bad Host header", "Host 헤더가 올바르지 않습니다")), content_type)
             return
         try:
-            with open(INSTALL_SH, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8") as fh:
                 script = fh.read()
         except OSError:
-            msg = say("install.sh is missing on the hub", "hub 에 install.sh 가 없습니다")
-            self._send(500, f"echo {shlex.quote(msg)} >&2; exit 1\n", shell)
+            self._send(500, fail(say("The installer is missing on the hub", "hub 에 설치 스크립트가 없습니다")), content_type)
             return
         # 받아 간 주소를 맨 앞에, hub 의 다른 주소(사내망·Tailscale)를 뒤에 싣는다.
         # 에이전트는 닿는 쪽으로 보낸다 — 노트북처럼 망을 오가는 서버도 끊기지 않는다.
         urls = ["http://" + host] + [u for u in PUBLIC_URLS if u != "http://" + host]
-        script = script.replace('SERVED_HUB=""', f"SERVED_HUB={shlex.quote(','.join(urls))}", 1)
-        script = script.replace('SERVED_TOKEN=""', f"SERVED_TOKEN={shlex.quote(self.store.token)}", 1)
-        script = script.replace('SERVED_LANG=""', f"SERVED_LANG={LANG}", 1)
-        self._send(200, script, shell)
+        names = ("ServedHub", "ServedToken", "ServedLang") if windows else ("SERVED_HUB", "SERVED_TOKEN", "SERVED_LANG")
+        for mark, key, value in zip(marks, names, (",".join(urls), self.store.token, LANG)):
+            script = script.replace(mark, fill(key, value), 1)
+        self._send(200, script, content_type)
 
-    def _serve_file(self, path, content_type):
+    def _serve_file(self, path, content_type, lf=False):
         try:
             with open(path, "rb") as fh:
                 body = fh.read()
+            if lf:
+                body = body.replace(b"\r\n", b"\n")
         except OSError:
             self._send(404, json.dumps({"error": "not found"}))
             return
@@ -457,6 +476,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    # 윈도우에서 출력을 파일로 돌리면 기본 인코딩(cp1252 등)이 한글을 못 써서 죽는다.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument(

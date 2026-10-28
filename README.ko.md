@@ -26,7 +26,11 @@ git clone https://github.com/zoo3323/gpu-monitor.git && cd gpu-monitor
 curl -fsSL --noproxy '*' "http://HUB:PORT/install.sh?t=TOKEN" | bash
 ```
 
-<sub>hub에 SSH로만 닿는 서버는 <code>./install.sh agent --ssh 사용자@hub --token TOKEN</code>으로 터널을 띄워 붙습니다 · 리눅스와 WSL2</sub>
+```powershell
+iex (irm 'http://HUB:PORT/install.ps1?t=TOKEN')   # 윈도우, WSL 없이
+```
+
+<sub>hub에 SSH로만 닿는 서버는 <code>./install.sh agent --ssh 사용자@hub --token TOKEN</code>으로 터널을 띄워 붙습니다</sub>
 
 **3. AI 작업 식별** — 서버마다 한 번
 
@@ -48,4 +52,4 @@ claude auth login
   </tr>
 </table>
 
-<sub>Linux + NVIDIA · Python 3.7 이상 · 작업 식별에 <a href="https://claude.com/claude-code">Claude Code</a>(선택) · English / 한국어 · <a href="docs/DETAILS.ko.md">자세히</a> · MIT</sub>
+<sub>NVIDIA · 리눅스 · WSL2 · 윈도우 · Python 3.7 이상 · 작업 식별에 <a href="https://claude.com/claude-code">Claude Code</a>(선택) · English / 한국어 · <a href="docs/DETAILS.ko.md">자세히</a> · MIT</sub>

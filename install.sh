@@ -491,6 +491,13 @@ install_hub() {
     say "  curl -fsSL --noproxy '*' \"http://$here:$port/install.sh?t=$token\" | bash"
   fi
   say
+  say "$(t "Windows PC (PowerShell, no WSL needed):" "윈도우 PC (PowerShell, WSL 없이):")"
+  if [ -n "$addrs" ]; then
+    printf '%s\n' "$addrs" | head -n 1 | while read -r a; do say "  iex (irm 'http://$a:$port/install.ps1?t=$token')"; done
+  else
+    say "  iex (irm 'http://$here:$port/install.ps1?t=$token')"
+  fi
+  say
   say "$(t "A server that reaches this hub only over SSH (key login):" "SSH(키 로그인)로만 이 hub에 닿는 서버:")"
   say "  git clone $REPO_URL && gpu-monitor/install.sh agent --ssh $ME@<$(t "this server" "이 서버")> --port $port --token $token"
   say "────────────────────────────────────────────────────────────"
