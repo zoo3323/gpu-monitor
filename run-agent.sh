@@ -43,4 +43,8 @@ fi
 
 # 토큰은 일부러 넘기지 않는다 — agent.py 가 monitor.env 를 직접 읽는다.
 # 명령줄에 실으면 같은 머신의 누구나 ps 로 본다.
+# 감독이 겹쳐도(systemd·cron·윈도우 작업) 하나만 돈다. 이미 돌고 있으면 조용히 끝난다.
+if command -v flock >/dev/null; then
+  exec flock -n "$PWD/.agent.lock" python3 "$PWD/agent.py" "${ARGS[@]}"
+fi
 exec python3 "$PWD/agent.py" "${ARGS[@]}"

@@ -10,3 +10,4 @@ backup_v1_*/
 __pycache__/
 *.log
 *.pid
+.*.lock

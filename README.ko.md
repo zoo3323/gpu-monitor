@@ -23,8 +23,10 @@ git clone https://github.com/zoo3323/gpu-monitor.git && cd gpu-monitor
 **2. GPU 서버마다** — hub가 알려 준 한 줄을 붙여 넣습니다
 
 ```bash
-curl -fsSL "http://HUB:PORT/install.sh?t=TOKEN" | bash
+curl -fsSL --noproxy '*' "http://HUB:PORT/install.sh?t=TOKEN" | bash
 ```
+
+<sub>hub에 SSH로만 닿는 서버는 <code>./install.sh agent --ssh 사용자@hub --token TOKEN</code>으로 터널을 띄워 붙습니다 · 리눅스와 WSL2</sub>
 
 **3. AI 작업 식별** — 서버마다 한 번
 

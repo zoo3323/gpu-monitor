@@ -23,8 +23,10 @@ git clone https://github.com/zoo3323/gpu-monitor.git && cd gpu-monitor
 **2. Each GPU server** — paste the line the hub prints
 
 ```bash
-curl -fsSL "http://HUB:PORT/install.sh?t=TOKEN" | bash
+curl -fsSL --noproxy '*' "http://HUB:PORT/install.sh?t=TOKEN" | bash
 ```
+
+<sub>Reaches the hub only over SSH? <code>./install.sh agent --ssh you@hub --token TOKEN</code> keeps a tunnel up · Linux and WSL2</sub>
 
 **3. Job names by AI** — once per server
 

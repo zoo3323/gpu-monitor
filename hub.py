@@ -33,9 +33,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DASHBOARD = os.path.join(HERE, "dashboard.html")
 # GPU 서버에서 한 줄로 에이전트를 깔 때 install.sh 가 hub 에서 받아 가는 파일들.
 INSTALL_SH = os.path.join(HERE, "install.sh")
-DIST_FILES = ("agent.py", "run-agent.sh", "watchdog.sh", "install.sh")
+DIST_FILES = ("agent.py", "run-agent.sh", "run-tunnel.sh", "watchdog.sh", "install.sh")
 # 화면 언어(en 기본 | ko). 대시보드의 기본 언어가 되고, 설치 한 줄로 붙는 에이전트에도 전해진다.
 LANG = os.environ.get("MONITOR_LANG") if os.environ.get("MONITOR_LANG") in ("en", "ko") else "en"
+
+
+# install.sh hub 가 적어 둔 이 hub 의 주소들(쉼표로 구분).
+PUBLIC_URLS = [u.strip().rstrip("/") for u in (os.environ.get("MONITOR_PUBLIC_URLS") or "").split(",")
+               if re.fullmatch(r"https?://[A-Za-z0-9.\-:\[\]]+", u.strip().rstrip("/"))]
 
 
 def say(en, ko):
@@ -391,7 +396,10 @@ class Handler(BaseHTTPRequestHandler):
             msg = say("install.sh is missing on the hub", "hub 에 install.sh 가 없습니다")
             self._send(500, f"echo {shlex.quote(msg)} >&2; exit 1\n", shell)
             return
-        script = script.replace('SERVED_HUB=""', f"SERVED_HUB={shlex.quote('http://' + host)}", 1)
+        # 받아 간 주소를 맨 앞에, hub 의 다른 주소(사내망·Tailscale)를 뒤에 싣는다.
+        # 에이전트는 닿는 쪽으로 보낸다 — 노트북처럼 망을 오가는 서버도 끊기지 않는다.
+        urls = ["http://" + host] + [u for u in PUBLIC_URLS if u != "http://" + host]
+        script = script.replace('SERVED_HUB=""', f"SERVED_HUB={shlex.quote(','.join(urls))}", 1)
         script = script.replace('SERVED_TOKEN=""', f"SERVED_TOKEN={shlex.quote(self.store.token)}", 1)
         script = script.replace('SERVED_LANG=""', f"SERVED_LANG={LANG}", 1)
         self._send(200, script, shell)

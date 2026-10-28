@@ -3,6 +3,7 @@
 #
 #   ./watchdog.sh            # 에이전트
 #   ./watchdog.sh hub        # hub
+#   ./watchdog.sh tunnel     # SSH 터널 (hub 에 SSH 로만 닿는 서버)
 #
 # systemd 가 없는 머신(예: systemd 를 안 켠 WSL2)에서 감독 역할을 대신한다.
 # 밖에서 주기적으로 부르는 것을 전제로 한다 — Windows 작업 스케줄러, cron 등.
@@ -16,7 +17,8 @@ WHAT="${1:-agent}"
 case "$WHAT" in
   agent) RUNNER="./run-agent.sh"; SCRIPT="agent.py"; LOG="agent.log" ;;
   hub)   RUNNER="./run-hub.sh";   SCRIPT="hub.py";   LOG="hub.log" ;;
-  *) echo "사용법: watchdog.sh [agent|hub]" >&2; exit 2 ;;
+  tunnel) RUNNER="./run-tunnel.sh"; SCRIPT="ExitOnForwardFailure"; LOG="tunnel.log" ;;
+  *) echo "사용법: watchdog.sh [agent|hub|tunnel]" >&2; exit 2 ;;
 esac
 PIDFILE="$PWD/$WHAT.pid"
 

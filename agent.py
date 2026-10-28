@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 
-AGENT_VERSION = "2.13.0"
+AGENT_VERSION = "2.14.0"
 
 # 화면에 보이는 문구의 언어: en(기본) | ko. 에이전트가 만드는 문구(빈 GPU 사유·AI 상태)와
 # AI 가 쓰는 작업 설명이 이 언어로 나온다. main() 이 --lang / $MONITOR_LANG 으로 정한다.
@@ -2485,15 +2485,47 @@ def public_snapshot(snapshot):
     return out
 
 
+# hub 는 사내망·VPN·SSH 터널 안에 있다. 서버에 http_proxy 가 걸려 있으면 urllib 이 그리로
+# 보내 버려 실패한다 — hub 로 가는 요청은 프록시를 쓰지 않는다.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class HubLink:
+    """hub 주소 여러 개(사내망·Tailscale·SSH 터널) 중 닿는 쪽으로 보낸다.
+
+    마지막으로 성공한 주소부터 시도하고, 실패하면 곧바로 다음 주소로 넘어간다.
+    노트북처럼 사무실·집을 오가는 서버가 주소를 바꿔 달 필요가 없다.
+    """
+    def __init__(self, urls):
+        self.urls = [u.strip().rstrip("/") for u in urls.split(",") if u.strip()]
+        self.good = 0
+
+    def push(self, token, snapshot, timeout=8.0):
+        body = json.dumps(public_snapshot(snapshot)).encode("utf-8")
+        last = None
+        for step in range(len(self.urls)):
+            i = (self.good + step) % len(self.urls)
+            try:
+                commands = push(self.urls[i], token, body, timeout)
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                last = exc
+                continue
+            if i != self.good:
+                print(f"[agent] hub 주소를 {self.urls[i]} 로 바꿨다", flush=True)
+                self.good = i
+            return commands
+        raise last or OSError("no hub url")
+
+
 def push(hub, token, snapshot, timeout=8.0):
-    body = json.dumps(public_snapshot(snapshot)).encode("utf-8")
+    body = snapshot if isinstance(snapshot, bytes) else json.dumps(public_snapshot(snapshot)).encode("utf-8")
     request = urllib.request.Request(
         hub.rstrip("/") + "/ingest",
         data=body,
         headers={"Content-Type": "application/json", "X-Monitor-Token": token},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _DIRECT.open(request, timeout=timeout) as response:
         # hub 는 대시보드에서 온 요청(다시 식별 등)을 이 응답에 실어 보낸다.
         try:
             reply = json.loads(response.read() or b"{}")
@@ -2513,7 +2545,8 @@ def handle_commands(args, commands):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hub", required=True, help="예: http://HOST:8787")
+    parser.add_argument("--hub", required=True,
+                        help="예: http://HOST:8787 — 쉼표로 여러 개를 주면 닿는 쪽으로 보낸다")
     parser.add_argument("--label", required=True, help="화면에 표시할 이름 (예: gpu-a)")
     parser.add_argument("--id", help="머신 고유 id (기본: label)")
     parser.add_argument("--token", default="",
@@ -2591,6 +2624,7 @@ def main():
           f"token={'설정됨' if args.token else '없음'} "
           f"ai={args.ai_mode}/{args.ai_auth}", flush=True)
     fails = 0
+    link = HubLink(args.hub)
     # 최근 수집 1회마다 든 CPU 초. 첫 수집은 뺀다 — 로그를 처음부터 한 번 읽는 비용이라
     # 그걸로 주기를 늘리면 켜자마자 몇 분 동안 화면이 굼떠진다.
     cpu_recent: collections.deque = collections.deque(maxlen=15)
@@ -2601,7 +2635,7 @@ def main():
         cpu_started = time.process_time()
         try:
             snapshot = build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus)
-            handle_commands(args, push(args.hub, args.token, snapshot))
+            handle_commands(args, link.push(args.token, snapshot))
             if fails:
                 print(f"[agent] hub 재연결 (실패 {fails}회 뒤)", flush=True)
             fails = 0

@@ -8,4 +8,8 @@ cd "$(dirname "$0")" || exit 1
 
 [ -f monitor.env ] && set -a && . ./monitor.env && set +a
 
+# 감독이 겹쳐도(systemd·cron·윈도우 작업) 하나만 돈다. 이미 돌고 있으면 조용히 끝난다.
+if command -v flock >/dev/null; then
+  exec flock -n "$PWD/.hub.lock" python3 "$PWD/hub.py" --port "${MONITOR_PORT:-8787}" --host "${MONITOR_HOST:-0.0.0.0}"
+fi
 exec python3 "$PWD/hub.py" --port "${MONITOR_PORT:-8787}" --host "${MONITOR_HOST:-0.0.0.0}"
