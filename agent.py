@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 
-AGENT_VERSION = "2.12.0"
+AGENT_VERSION = "2.13.0"
 
 # 화면에 보이는 문구의 언어: en(기본) | ko. 에이전트가 만드는 문구(빈 GPU 사유·AI 상태)와
 # AI 가 쓰는 작업 설명이 이 언어로 나온다. main() 이 --lang / $MONITOR_LANG 으로 정한다.
@@ -47,6 +47,7 @@ LANG = "en"
 MSG = {
     "workers": ("{n} workers", "워커 {n}"),
     "others": ("+{n} more", "외 {n}개"),
+    "procs": ("{n} processes", "프로세스 {n}개"),
     "graphics": ("graphics {who}", "그래픽 {who}"),
     "no_proc": ("in use, but no process found", "점유 중이지만 프로세스를 찾지 못했습니다"),
     "free": ("available", "사용 가능"),
@@ -624,10 +625,21 @@ def collect_gpu_processes(minor_to_bus, fd_scan=True):
         if pid is None:
             continue
         pid = int(pid)
+        uuid, mb = parts[0] or None, to_num(parts[2])
+        # 한 프로세스가 GPU 여러 장을 쓰면(DataParallel·텐서 병렬) GPU 마다 한 줄씩 온다.
+        # pid 로 덮어쓰면 한 장에만 붙으므로 GPU 목록을 모은다.
+        if pid in by_pid and uuid:
+            have = by_pid[pid]
+            have.setdefault("gpu_uuids", []).append(uuid)
+            have.setdefault("vram_by_uuid", {})[uuid] = mb
+            have["vram_mb"] = sum(v for v in have["vram_by_uuid"].values() if v)
+            continue
         found = {
             "pid": pid,
-            "gpu_uuid": parts[0] or None,
-            "vram_mb": to_num(parts[2]),
+            "gpu_uuid": uuid,
+            "gpu_uuids": [uuid] if uuid else [],
+            "vram_by_uuid": {uuid: mb} if uuid else {},
+            "vram_mb": mb,
             "source": "nvidia-smi",
             "kind": "compute",
         }
@@ -690,11 +702,14 @@ def attach_processes(gpus, procs, opaque):
         uuid, bus = gpu.get("uuid"), gpu.get("bus_id")
         mine = []
         for proc in procs:
-            if proc.get("gpu_uuid") and uuid and proc["gpu_uuid"] == uuid:
-                mine.append(proc)
+            uuids = proc.get("gpu_uuids") or ([proc["gpu_uuid"]] if proc.get("gpu_uuid") else [])
+            if uuid and uuid in uuids:
+                # GPU 마다 그 GPU 에서 쓰는 VRAM 으로 사본을 만든다.
+                per = (proc.get("vram_by_uuid") or {}).get(uuid)
+                mine.append(dict(proc, vram_mb=per) if per is not None else proc)
             elif bus and bus in (proc.get("bus_ids") or []):
                 mine.append(proc)
-            elif single and not proc.get("gpu_uuid") and not proc.get("bus_ids"):
+            elif single and not uuids and not proc.get("bus_ids"):
                 # GPU 가 한 장이면 귀속할 곳이 하나뿐이다.
                 mine.append(proc)
         mine.sort(key=lambda p: (p.get("kind") != "compute",
@@ -780,6 +795,180 @@ def attach_processes(gpus, procs, opaque):
 
     # 어느 GPU 에도 붙지 못한 점유자 — 멀티 GPU 에서 귀속에 실패한 경우다.
     return [p for p in procs if p["pid"] not in claimed]
+
+
+# --------------------------------------------------------------------------
+# 작업 묶기 — GPU 점유자를 '작업' 단위로 모은다
+#
+# 화면의 한 줄은 GPU 가 아니라 작업이다. 여러 GPU 를 쓰는 학습 하나(DDP)는 GPU 마다
+# 프로세스가 따로 떠도 한 줄이어야 하고 AI 식별도 한 번이어야 한다. 반대로 한 GPU 에
+# 서로 다른 작업 둘이 돌면 두 줄이어야 한다.
+# --------------------------------------------------------------------------
+# '같은 부모'를 같은 작업의 근거로 쓰지 않는 부모들. 셸·세션 관리자는 서로 다른 작업을
+# 여럿 띄우는 곳이라, 거기서 같이 떴다는 사실이 같은 작업을 뜻하지 않는다.
+SESSION_COMMS = {
+    "bash", "sh", "dash", "zsh", "fish", "ksh", "tcsh", "csh", "tmux: server", "tmux",
+    "screen", "SCREEN", "sshd", "systemd", "init", "login", "su", "sudo", "nohup", "setsid",
+    "cron", "crond", "containerd-shim", "docker-init", "tini", "dumb-init", "runc",
+}
+# 분산 학습이 rank 마다 넣는 환경 변수. 값이 같으면 같은 학습이다.
+DIST_ENV_KEYS = (b"WORLD_SIZE", b"MASTER_ADDR", b"MASTER_PORT", b"TORCHELASTIC_RUN_ID")
+
+
+def proc_stat(pid):
+    """(ppid, comm). 못 읽으면 None."""
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+        return int(raw.rsplit(") ", 1)[1].split()[1]), raw[raw.index("(") + 1:raw.rindex(")")]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def dist_key(pid):
+    """(환경을 읽었나, 분산 학습 표식 또는 None). 표식 말고는 환경을 밖으로 내지 않는다."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return False, None  # 남의 프로세스
+    env = {}
+    for item in raw.split(b"\0"):
+        key, _, value = item.partition(b"=")
+        if key in DIST_ENV_KEYS:
+            env[key.decode()] = value.decode("utf-8", "replace")
+    try:
+        world = int(env.get("WORLD_SIZE") or 0)
+    except ValueError:
+        world = 0
+    if world <= 1:
+        return True, None
+    return True, (env.get("TORCHELASTIC_RUN_ID"), env.get("MASTER_ADDR"), env.get("MASTER_PORT"), world)
+
+
+def _launch_sig(cmdline):
+    """형제 프로세스를 같은 작업으로 볼 때 비교하는 명령. multiprocessing 자식은
+    파이프 번호만 다르므로 숫자를 지운다."""
+    cmdline = cmdline or ""
+    if "multiprocessing" in cmdline:
+        return "mp:" + re.sub(r"\d+", "#", cmdline)
+    return cmdline
+
+
+def group_jobs(gpus, stat=proc_stat, dist=dist_key):
+    """GPU 컴퓨트 점유자를 작업으로 묶는다. 작업 목록을 GPU 번호 순으로 돌려준다.
+
+    한 작업으로 보는 경우:
+      1. 같은 프로세스가 GPU 여러 장에 있다(DataParallel·텐서 병렬).
+      2. GPU 를 쓰는 프로세스의 자손이다(mp.spawn·vLLM 워커·데이터로더).
+      3. 셸이 아닌 같은 부모에서 같은 명령으로 떴다(torchrun·deepspeed·accelerate 의 rank).
+         단, 둘 다 환경을 읽을 수 있는데 분산 학습 표식이 없으면 따로 띄운 작업으로 본다.
+      4. 분산 학습 랑데부(MASTER_ADDR·MASTER_PORT·RUN_ID)가 같다.
+    """
+    procs: dict[int, dict] = {}
+    where: dict[int, set] = {}
+    vram: dict[int, float] = {}
+    for gpu in gpus:
+        for p in gpu.get("processes") or []:
+            if p.get("kind") != "compute":
+                continue
+            procs.setdefault(p["pid"], p)
+            where.setdefault(p["pid"], set()).add(gpu.get("index"))
+            vram[p["pid"]] = vram.get(p["pid"], 0.0) + (p.get("vram_mb") or 0.0)
+    if not procs:
+        return []
+
+    root = {pid: pid for pid in procs}
+
+    def find(x):
+        while root[x] != x:
+            root[x] = root[root[x]]
+            x = root[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            root[max(ra, rb)] = min(ra, rb)
+
+    stats = {pid: stat(pid) for pid in procs}
+    ancestors: dict[int, set] = {}
+    for pid in procs:                                     # 2. 자손
+        seen, cur = set(), pid
+        for _ in range(12):
+            st = stats.get(cur) if cur in stats else stat(cur)
+            if not st or st[0] <= 1:
+                break
+            cur = st[0]
+            seen.add(cur)
+            if cur in procs:
+                union(pid, cur)
+        ancestors[pid] = seen
+    siblings: dict[tuple, list] = {}
+    for pid, p in procs.items():                          # 3. 같은 부모·같은 명령
+        st = stats.get(pid)
+        if not st or st[0] <= 1:
+            continue
+        parent = stat(st[0])
+        if not parent or parent[1] in SESSION_COMMS:
+            continue
+        siblings.setdefault((st[0], _launch_sig(p.get("cmdline"))), []).append(pid)
+    keys = {pid: dist(pid) for pid in procs}
+    for (_, sig), pids in siblings.items():
+        explicit = all(keys[pid][0] and keys[pid][1] is None for pid in pids)
+        if explicit and not sig.startswith("mp:"):
+            continue
+        for pid in pids[1:]:
+            union(pids[0], pid)
+    by_key: dict[tuple, int] = {}
+    for pid, (_, key) in keys.items():                    # 4. 같은 랑데부
+        if key is not None:
+            if key in by_key:
+                union(by_key[key], pid)
+            else:
+                by_key[key] = pid
+
+    groups: dict[int, list] = {}
+    for pid in procs:
+        groups.setdefault(find(pid), []).append(pid)
+    jobs = []
+    for pids in groups.values():
+        members = set(pids)
+        heads = [pid for pid in pids if not (ancestors[pid] & members)]
+        leader = procs[min(heads or pids)]
+        gpu_ids = sorted({i for pid in pids for i in where[pid] if i is not None})
+        jobs.append({
+            "id": f"{leader['pid']}-{leader.get('start_ticks')}",
+            "gpus": gpu_ids,
+            "pids": sorted(pids),
+            "vram_mb": sum(vram[pid] for pid in pids),
+            "_leader": leader,
+            "_procs": [procs[pid] for pid in sorted(pids)],
+        })
+    jobs.sort(key=lambda j: (j["gpus"][:1] or [9999], -j["vram_mb"]))
+    return jobs
+
+
+def job_public(job):
+    """스냅샷에 싣는 작업. 명령줄·작업 디렉터리는 싣지 않는다."""
+    leader = job["_leader"]
+    name = leader.get("name") or f"pid {leader['pid']}"
+    # multiprocessing 자식은 명령줄이 'python -c from multiprocessing…' 라 이름이 안 된다.
+    # 부모(실제로 띄운 스크립트)의 이름을 쓴다.
+    if "multiprocessing" in (leader.get("cmdline") or "") and leader.get("ppid"):
+        parent_cmd, parent = _read_cmdline(leader["ppid"]), proc_stat(leader["ppid"])
+        if parent_cmd:
+            name = command_label(parent[1] if parent else None, parent_cmd)
+    name = name.replace("pt_elastic", "torchrun", 1)  # torchrun 이 스스로 바꾼 프로세스 이름
+    label = f"{name} ({leader['user']})" if leader.get("user") else name
+    if len(job["pids"]) > 1:
+        label += " · " + T("procs", n=len(job["pids"]))
+    return {
+        "id": job["id"], "gpus": job["gpus"], "pids": job["pids"], "vram_mb": job["vram_mb"],
+        "label": label, "paused": leader.get("state") == "T",
+        "leader": {k: leader.get(k) for k in ("pid", "name", "user", "state", "elapsed_sec")},
+        "ai": job.get("ai"), "run": job.get("run"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1519,45 +1708,41 @@ def discover_gpu_run_logs(gpus, names):
     return found
 
 
-def link_runs_to_gpus(gpus, runs):
-    """GPU 마다 그 GPU 에서 돌고 있는 학습 런을 붙인다 (gpu["run"]).
+def link_runs_to_jobs(jobs, runs):
+    """작업마다 그 작업이 돌리고 있는 학습 런을 붙인다 (job["run"]).
 
-    컴퓨트 점유자가 런 디렉터리 안의 파일을 열고 있거나, 그 안에서 떴거나,
+    작업의 프로세스가 런 디렉터리 안의 파일을 열고 있거나, 그 안에서 떴거나,
     명령줄에 그 경로를 실었으면 그 런의 주인이다. 아무 단서도 없더라도 돌고 있는
-    런과 컴퓨트 점유 GPU 가 각각 딱 하나면 그 둘을 잇는다. 추론·렌더링처럼
-    런에 묶이지 않는 점유자는 run 이 None 으로 남는다 — 대시보드는 그걸 보고
-    '학습 중이 아니다'라고 판단한다.
+    런과 작업이 각각 딱 하나면 그 둘을 잇는다. 추론·렌더링처럼 런에 묶이지 않는
+    작업은 run 이 None 으로 남는다 — 대시보드는 그걸 보고 '학습 중이 아니다'라고 본다.
     """
-    # 멈춘(idle) 런도 후보다. 프로세스가 아직 그 런의 파일을 물고 있다면 그 GPU 는
+    # 멈춘(idle) 런도 후보다. 프로세스가 아직 그 런의 파일을 물고 있다면 GPU 는
     # 그 학습 때문에 잡혀 있는 것이고, 화면은 '멈춤'이라고 알려야 한다.
     live = [r for r in runs if r.get("status") in ("running", "idle") and r.get("dir")]
     running = [r for r in live if r.get("status") == "running"]
-    for gpu in gpus:
-        gpu["run"] = None
+    for job in jobs:
+        job["run"] = None
     if not live:
         return
-    busy = [g for g in gpus
-            if any(p.get("kind") == "compute" for p in g.get("processes") or [])]
     taken: set[str] = set()
-    for gpu in busy:
-        paths = [path for proc in gpu["processes"] if proc.get("kind") == "compute"
-                 for path in process_paths(proc)]
+    for job in jobs:
+        paths = [path for proc in job["_procs"] for path in process_paths(proc)]
         # 단서가 여러 런을 가리킬 수 있다 — branch 단계는 명령줄에 stem 체크포인트
         # (--resume .../stem/step.pt)를 싣는다. 로그가 살아 있는 쪽이 지금 도는 런이다.
         matches = [run for run in live
                    if any(path == run["dir"].rstrip("/")
                           or path.startswith(run["dir"].rstrip("/") + "/") for path in paths)]
         if matches:
-            gpu["run"] = min(matches, key=lambda r: (r.get("status") != "running",
+            job["run"] = min(matches, key=lambda r: (r.get("status") != "running",
                                                      r.get("log_age_sec") or 0))
-            taken.add(gpu["run"]["dir"].rstrip("/"))
-    unlinked = [g for g in busy if g["run"] is None]
+            taken.add(job["run"]["dir"].rstrip("/"))
+    unlinked = [j for j in jobs if j["run"] is None]
     spare = [r for r in running if r["dir"].rstrip("/") not in taken]
     if len(unlinked) == 1 and len(spare) == 1 and not taken:
         unlinked[0]["run"] = spare[0]
-    for gpu in gpus:
-        if gpu["run"] is not None:
-            gpu["run"] = run_brief(gpu["run"])
+    for job in jobs:
+        if job["run"] is not None:
+            job["run"] = run_brief(job["run"])
 
 
 def run_brief(run):
@@ -1623,6 +1808,10 @@ AI_STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL
                 "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
 # claude 설치·로그인 상태를 이 주기로 다시 본다(로그인 만료는 조용히 온다).
 AI_STATUS_CHECK_SEC = 300.0
+# 준비가 안 됐을 때(로그인 필요 등)는 자주 본다 — 로그인하면 곧바로 식별이 시작되게.
+AI_STATUS_RETRY_SEC = 30.0
+# 대시보드의 '다시 식별' 요청. 같은 작업은 이 간격 안에 한 번만 받는다(비용).
+AI_REDO_COOLDOWN_SEC = 60.0
 # systemd 서비스는 로그인 셸의 PATH 를 못 받는다. 흔한 설치 위치를 직접 본다.
 CLAUDE_CANDIDATES = ("~/.local/bin/claude", "~/.claude/local/claude", "/usr/local/bin/claude",
                      "/opt/homebrew/bin/claude", "~/.npm-global/bin/claude", "/usr/bin/claude")
@@ -1819,6 +2008,8 @@ class AiIdentifier:
         self.counter = ProgressCounter()
         self._stale: set[int] = set()
         self._extra_flags: list[str] | None = None
+        self.job_keys: dict[str, str] = {}      # 작업 id → 캐시 키 (다시 식별 요청용)
+        self.redo_at: dict[str, float] = {}
         # 상태: 준비됐나(claude 있음·읽기 전용 가능·로그인) / 아니면 왜 / 최근 식별 실패
         self.ready = False
         self.off = False
@@ -1869,7 +2060,8 @@ class AiIdentifier:
 
     def _maybe_check(self, now):
         with self.lock:
-            if self._checking or now - self._checked_at < AI_STATUS_CHECK_SEC:
+            every = AI_STATUS_CHECK_SEC if self.ready else AI_STATUS_RETRY_SEC
+            if self._checking or now - self._checked_at < every:
                 return
             self._checking = True
         threading.Thread(target=self._check, daemon=True).start()
@@ -1961,7 +2153,7 @@ class AiIdentifier:
             start = int(leader.get("started_at") or 0)
         return f"{gpu.get('uuid') or gpu.get('index')}-{leader['pid']}-{start}"
 
-    def _facts(self, leader):
+    def _facts(self, leader, job_gpus=(), nprocs=1):
         lines = [f"pid {leader['pid']} (user {leader.get('user')}, "
                  f"running for {int(leader.get('elapsed_sec') or 0)}s)",
                  f"command line: {leader.get('cmdline')}",
@@ -1972,15 +2164,19 @@ class AiIdentifier:
         chain = _parent_chain(leader["pid"])
         if chain:
             lines.append("parent processes:\n  " + "\n  ".join(chain))
+        if len(job_gpus) > 1 or nprocs > 1:
+            lines.append(f"this job uses GPUs {', '.join(str(i) for i in job_gpus)} "
+                         f"with {nprocs} processes (e.g. distributed training ranks)")
         return "\n".join(lines)
 
-    def _ask(self, key, gpu_name, leader):
+    def _ask(self, key, gpu_name, leader, job_gpus=(), nprocs=1):
         started = time.time()
         result = None
         error = None
         try:
             # 프롬프트도 try 안에서 만든다 — 여기서 죽으면 running 이 풀리지 않아 식별이 영영 멈춘다.
-            prompt = AI_PROMPT.format(label=self.label, gpu=gpu_name, facts=self._facts(leader),
+            prompt = AI_PROMPT.format(label=self.label, gpu=gpu_name,
+                                      facts=self._facts(leader, job_gpus, nprocs),
                                       **AI_LANG.get(LANG, AI_LANG["en"]))
             proc = subprocess.run(
                 [self.command, "-p", prompt, "--output-format", "json",
@@ -2045,6 +2241,25 @@ class AiIdentifier:
         print(f"[agent] AI 식별: {result.get('title')} ({result.get('took_sec')}s, "
               f"${result.get('cost_usd')})", flush=True)
 
+    def reidentify(self, job_id, now=None):
+        """대시보드의 '다시 식별'. 그 작업의 답을 버리고 곧바로 다시 묻는다.
+
+        로그인 상태도 바로 다시 본다 — 막혀 있던 이유가 로그인이었다면 그것부터 풀린다.
+        """
+        now = now or time.time()
+        key = self.job_keys.get(job_id)
+        if key is None or now - self.redo_at.get(key, 0) < AI_REDO_COOLDOWN_SEC:
+            return False
+        self.redo_at[key] = now
+        self.forget(key)
+        with self.lock:
+            self.failed_at.pop(key, None)
+            self.first_seen[key] = now - AI_STABLE_SEC  # 이미 충분히 살아 있었다
+            self._checked_at = 0.0
+            self.last_error = None
+        print(f"[agent] 다시 식별 요청: {job_id}", flush=True)
+        return True
+
     def forget(self, key):
         with self.lock:
             self.results.pop(key, None)
@@ -2054,23 +2269,28 @@ class AiIdentifier:
             pass
 
     # 스냅샷에 반영 ----------------------------------------------------------
-    def apply(self, gpus, runs, now):
-        """GPU 마다 AI 답을 붙이고, 답이 가리킨 로그로 진행률을 잡는다."""
+    def apply(self, jobs, gpus, runs, now):
+        """작업마다 AI 답을 붙이고, 답이 가리킨 로그로 진행률을 잡는다.
+
+        여러 GPU 를 쓰는 작업도 한 번만 묻는다. 캐시 키는 작업의 첫 GPU 와 대표
+        프로세스로 만든다 — GPU 한 장짜리 작업이면 예전 키와 같아 캐시가 그대로 쓰인다.
+        """
         self._maybe_check(now)
+        by_index = {g.get("index"): g for g in gpus}
         alive = set()
-        for gpu in gpus:
-            leader = gpu_leader(gpu)
-            if leader is None:
-                continue
-            key = self.fingerprint(gpu, leader)
+        for job in jobs:
+            leader = job["_leader"]
+            primary = by_index.get(job["gpus"][0]) if job["gpus"] else None
+            key = self.fingerprint(primary or {"index": "x"}, leader)
+            self.job_keys[job["id"]] = key
             alive.add(key)
             self.first_seen.setdefault(key, now)
             result = self._load(key)
             if result is None:
-                self._maybe_start(key, gpu, leader, now)
-                gpu["ai"] = {"status": "pending" if self.running == key else "waiting"}
+                self._maybe_start(key, primary or {}, leader, job, now)
+                job["ai"] = {"status": "pending" if self.running == key else "waiting"}
                 continue
-            gpu["ai"] = {"status": "done", **{k: result.get(k) for k in (
+            job["ai"] = {"status": "done", **{k: result.get(k) for k in (
                 "kind", "title", "summary", "stage", "next", "next_short", "next_source",
                 "rest_sec", "rest_stages", "rest_basis", "run_dir", "log_path",
                 "identified_at")}}
@@ -2079,8 +2299,9 @@ class AiIdentifier:
                 self._stale.discard(id(result))
                 self.forget(key)
             if run is not None:
-                gpu["run"] = run_brief(run)
-                busy = (gpu.get("util_pct") or 0) > FREE_UTIL_PCT
+                job["run"] = run_brief(run)
+                busy = any(((by_index.get(i) or {}).get("util_pct") or 0) > FREE_UTIL_PCT
+                           for i in job["gpus"])
                 if (run.get("status") == "idle" and busy
                         and now - (result.get("identified_at") or 0) > AI_RECHECK_SEC):
                     # 답한 로그는 멈췄는데 GPU 는 일한다 = 같은 프로세스가 다음 단계로
@@ -2090,8 +2311,9 @@ class AiIdentifier:
             if key not in alive:
                 self.first_seen.pop(key, None)
                 self.results.pop(key, None)
+        self.job_keys = {jid: key for jid, key in self.job_keys.items() if key in alive}
 
-    def _maybe_start(self, key, gpu, leader, now):
+    def _maybe_start(self, key, gpu, leader, job, now):
         with self.lock:
             if self.running is not None or not self.ready:
                 return
@@ -2100,7 +2322,8 @@ class AiIdentifier:
             if now - self.failed_at.get(key, 0) < AI_RETRY_SEC:
                 return
             self.running = key
-        threading.Thread(target=self._ask, args=(key, gpu.get("name"), leader),
+        threading.Thread(target=self._ask,
+                         args=(key, gpu.get("name"), leader, list(job["gpus"]), len(job["pids"])),
                          daemon=True).start()
 
     def _run_for(self, result, runs, now):
@@ -2175,6 +2398,7 @@ def build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus):
     # WSL2 라면 창 관리자 상시 점유와 실제 작업을 구분할 수 없으니 올려야 한다.
     opaque = wsl and not procs
     unattributed = safe(lambda: attach_processes(gpus, procs, opaque), []) or []
+    jobs = safe(lambda: group_jobs(gpus), []) or []
     free_gpus = [g["index"] for g in gpus
                  if isinstance(g, dict) and g.get("is_free")]
     runs = (safe(lambda: collect_runs(args.watch, args.run_log, now), [])
@@ -2187,14 +2411,20 @@ def build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus):
             run = safe(lambda: describe_run(log_path, now))
             if isinstance(run, dict) and "error" not in run:
                 runs.insert(0, run)
-    safe(lambda: link_runs_to_gpus(gpus, runs))
+    safe(lambda: link_runs_to_jobs(jobs, runs))
     if getattr(args, "ai", None) is not None:
-        safe(lambda: args.ai.apply(gpus, runs, now))
+        safe(lambda: args.ai.apply(jobs, gpus, runs, now))
+    # 옛 대시보드는 GPU 마다 run·ai 를 읽는다. 그 GPU 의 첫 작업 것을 그대로 둔다.
+    for gpu in gpus:
+        first = next((j for j in jobs if gpu.get("index") in j["gpus"]), None)
+        gpu["run"] = first.get("run") if first else None
+        if first and first.get("ai"):
+            gpu["ai"] = first["ai"]
     # loss 곡선은 지금 GPU 에서 도는 런 것만 싣는다. 화면은 그것만 그리는데, 끝난 런
     # 곡선까지 실으면 스냅샷이 머신당 200KB 를 넘었다(2초마다).
     # 지표(metrics)도 같다 — 런마다 키 32개씩, 끝난 런 9개 몫이 스냅샷의 40% 였다.
-    shown = {g["run"]["dir"] for g in gpus
-             if isinstance(g, dict) and isinstance(g.get("run"), dict) and g["run"].get("dir")}
+    shown = {j["run"]["dir"] for j in jobs
+             if isinstance(j.get("run"), dict) and j["run"].get("dir")}
     attach_loss_histories(runs, shown)
     for run in runs:
         if run.get("dir") not in shown:
@@ -2219,6 +2449,7 @@ def build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus):
         "disks": safe(lambda: collect_disks(args.disk), []),
         "uptime_sec": safe(collect_uptime, None),
         "gpus": gpus,
+        "jobs": [job_public(j) for j in jobs],
         "gpu_processes": procs,
         "unattributed_processes": unattributed,
         "proc_scan_truncated": bool(scan_truncated),
@@ -2263,7 +2494,21 @@ def push(hub, token, snapshot, timeout=8.0):
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.status
+        # hub 는 대시보드에서 온 요청(다시 식별 등)을 이 응답에 실어 보낸다.
+        try:
+            reply = json.loads(response.read() or b"{}")
+        except ValueError:
+            reply = {}
+    commands = reply.get("commands") if isinstance(reply, dict) else None
+    return commands if isinstance(commands, list) else []
+
+
+def handle_commands(args, commands):
+    for cmd in commands:
+        if not isinstance(cmd, dict):
+            continue
+        if cmd.get("type") == "reidentify" and getattr(args, "ai", None) is not None:
+            args.ai.reidentify(str(cmd.get("job_id") or ""))
 
 
 def main():
@@ -2356,7 +2601,7 @@ def main():
         cpu_started = time.process_time()
         try:
             snapshot = build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus)
-            push(args.hub, args.token, snapshot)
+            handle_commands(args, push(args.hub, args.token, snapshot))
             if fails:
                 print(f"[agent] hub 재연결 (실패 {fails}회 뒤)", flush=True)
             fails = 0

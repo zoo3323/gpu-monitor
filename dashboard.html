@@ -150,6 +150,15 @@ main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
 .hold { position: fixed; right: 16px; bottom: 16px; z-index: 30; padding: 6px 10px;
   border-radius: 8px; font-size: 12px; background: var(--surface); color: var(--ink-2);
   border: 1px solid var(--ring); box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+.gtabs { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 10px; }
+.gtab { font: inherit; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  padding: 3px 10px; border: 1px solid var(--ring); border-radius: 7px; background: transparent; color: var(--ink-2); }
+.gtab:hover { background: var(--hover); }
+.gtab.on { background: var(--surface); color: var(--ink); font-weight: 600; border-color: var(--axis); }
+.gtab .gd { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+.gtab .gd.on { background: var(--s1); }
+.aibox .redo { font-size: 11.5px; padding: 1px 8px; margin-left: 10px; vertical-align: 1px; }
+.aibox .redo-note { margin-left: 10px; }
 .aibox p { margin: 3px 0 0; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
 .aibox p.sub { white-space: normal; max-width: none; }
 /* 폰 폭: 점유 프로세스 칸과 바를 접는다 — 이름·%·종료시각만으로 답이 된다. */
@@ -248,6 +257,8 @@ const I18N = {
     tabAlerts: (n) => `⚠ ${n} alert${n === 1 ? "" : "s"}`, tabFree: (f, n) => `${f}/${n} GPUs free`,
     tabNoFree: "No free GPU", hold: "Selecting text · live updates paused",
     connDown: "Lost the hub · reconnecting",
+    redo: "Re-identify", redoSending: "Sending…", redoSent: "Requested — re-identifying",
+    redoWait: "Just requested — try again in a minute", redoFail: "Couldn't send",
   },
   ko: {
     title: "GPU 모니터", theme: "테마", other: "English", empty: "아직 보고한 에이전트가 없습니다.",
@@ -273,6 +284,8 @@ const I18N = {
     tabAlerts: (n) => `⚠ 경고 ${n}건`, tabFree: (f, n) => `빈 GPU ${f}/${n}`,
     tabNoFree: "빈 GPU 없음", hold: "글 선택 중 · 실시간 갱신 멈춤",
     connDown: "hub 연결 끊김 · 재연결 중",
+    redo: "다시 식별", redoSending: "보내는 중…", redoSent: "요청했습니다 — 다시 식별합니다",
+    redoWait: "방금 요청했습니다 — 1분 뒤에 다시 누르세요", redoFail: "보내지 못했습니다",
   },
 };
 const LANG_KEY = "gpumon-lang";
@@ -456,11 +469,12 @@ function buildSeries(machines, metric, now) {
   const lines = [];
   for (const m of machines) {
     if (!shown(m)) continue;
-    const g = (m.gpus || [])[0] || {};
+    const g = pickedGpu(m);
     const idx = g.index;
     const pts = (m.history || []).filter((h) => now - h.t <= rangeSec)
       .map((h) => ({ t: h.t, v: metric.hist(h, idx) })).filter((p) => num(p.v));
-    lines.push({ id: m.machine_id, name: m.label || m.machine_id,
+    const label = m.label || m.machine_id;
+    lines.push({ id: m.machine_id, name: (m.gpus || []).length > 1 ? `${label} · GPU${idx}` : label,
                  color: colorOf.get(m.machine_id), pts,
                  cur: metric.cur(m, g), online: m.online });
   }
@@ -479,9 +493,46 @@ function panelHtml(metric, series, i) {
   </section>`;
 }
 
-function trainingRuns(m) {
-  return (m.gpus || []).filter((g) => g.run).map((g) => ({
-    gpu: g, run: (m.runs || []).find((r) => r.dir === g.run.dir) || g.run }));
+// 작업 — 표의 한 줄. 새 에이전트는 jobs 를 보낸다: 여러 GPU 를 쓰는 학습 하나는 한 작업,
+// 한 GPU 의 서로 다른 작업은 따로. 옛 에이전트면 점유자가 있는 GPU 하나를 한 작업으로 본다.
+function jobsOf(m) {
+  const full = (brief) => brief ? ((m.runs || []).find((r) => r.dir === brief.dir) || brief) : null;
+  if (Array.isArray(m.jobs)) return m.jobs.map((j) => ({ id: j.id, gpus: j.gpus || [], ai: j.ai,
+    brief: j.run, run: full(j.run), label: j.label, paused: !!j.paused }));
+  return (m.gpus || []).filter((g) => g.compute_process_count > 0 || g.run).map((g) => ({
+    id: null, gpus: [g.index], ai: g.ai, brief: g.run, run: full(g.run),
+    label: g.state_reason, paused: !!g.paused }));
+}
+// 머신 상세에서 고른 GPU. 상세의 GPU 정보·작업 설명·loss 와 위쪽 그래프가 이 GPU 를 따른다.
+const selGpu = new Map();
+function pickedGpu(m) {
+  const gs = m.gpus || [];
+  return gs.find((g) => g.index === selGpu.get(m.machine_id)) || gs[0] || {};
+}
+// 'GPU0–3' · 'GPU0,2' · 'GPU1'
+function gpuLabel(ids) {
+  const s = [...ids].sort((a, b) => a - b);
+  if (s.length > 1 && s[s.length - 1] - s[0] === s.length - 1) return `GPU${s[0]}–${s[s.length - 1]}`;
+  return "GPU" + s.join(",");
+}
+// loss 를 그릴 작업: 고른 GPU 에서 도는 학습 중 loss 가 있는 것.
+function lossJob(m) {
+  const gi = pickedGpu(m).index;
+  return jobsOf(m).find((j) => j.gpus.includes(gi) && j.run && (j.run.loss_history || []).length > 1) || null;
+}
+// '다시 식별' 버튼 상태(이 브라우저). 결과를 잠깐 보여 준다.
+const redoState = new Map();
+async function requestRedo(mid, jobId) {
+  redoState.set(jobId, { label: t("redoSending"), at: Date.now() });
+  if (lastData) render(lastData);
+  let label;
+  try {
+    const res = await fetch("api/reidentify", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ machine_id: mid, job_id: jobId }) });
+    label = res.ok ? t("redoSent") : res.status === 429 ? t("redoWait") : t("redoFail");
+  } catch (err) { label = t("redoFail"); }
+  redoState.set(jobId, { label, at: Date.now() });
+  if (lastData) render(lastData);
 }
 
 // 예상 종료 '시각'. eta_sec 는 에이전트가 스냅샷을 찍은 시점 기준이라 보고 지연만큼 뺀다.
@@ -579,50 +630,58 @@ function bindLoss(box, cols) {
 // =====================================================================
 function machineTable(machines) {
   const rows = machines.map((m) => {
-    const g = (m.gpus || [])[0] || {};
-    const training = trainingRuns(m);
-    const run = training.length ? training[0].run : null;
+    const gpus = m.gpus || [];
+    const g = pickedGpu(m);
+    const jobs = jobsOf(m);
     const open = openDetails.has(m.machine_id);
-    const multi = (m.gpus || []).length > 1;
+    const multi = gpus.length > 1;
     // AI 가 식별했으면 그 이름을 쓴다(런 폴더 이름 'finetune' 보다 '무슨 실험'인지 보인다).
-    const aiOf = (gpu) => gpu && gpu.ai && gpu.ai.status === "done" ? gpu.ai : null;
-    // GPU 한 장 = 한 줄. 점유와 학습을 합쳐 '지금 무엇을 하는가' 한 줄로 쓴다.
-    const lines = ((m.gpus || []).length ? m.gpus : [{}]).map((gpu) => {
-      const tr = training.find((x) => x.gpu === gpu);
-      const r = tr && tr.run, a = aiOf(gpu);
+    const aiOf = (j) => j.ai && j.ai.status === "done" ? j.ai : null;
+    const jobLine = (j) => {
+      const r = j.run, a = aiOf(j);
       const stalled = r && r.status !== "running" && num(r.log_age_sec);
       // 진행률이 있는 작업은 맥박 점. 학습이 아닌 작업(데이터 캡처·평가 등)은 '작업 중'으로 부른다.
       const working = a && a.kind && a.kind !== "training";
       // 정지 신호로 세워 둔 작업은 고장(멈춤)이 아니라 일시정지다 — 회색으로 따로 보인다.
-      const state = !m.online ? "off" : gpu.paused ? "pause"
-        : r ? (stalled ? (working ? "wstall" : "stall") : (working ? "work" : "train"))
-        : gpu.state === "free" ? "free" : gpu.state === "busy" ? "busy" : "unknown";
-      const pendingAi = gpu.ai && gpu.ai.status === "pending";
-      const what = !m.online ? t("offline", ago(m.age_sec))
-        : r ? (a ? a.title : r.name)
-        : a && gpu.state !== "free" ? a.title
-        : gpu.state === "free" ? t("available")
-        : (gpu.state_reason || t("inUse")) + (pendingAi ? t("aiChecking") : "");
+      const state = j.paused ? "pause"
+        : r ? (stalled ? (working ? "wstall" : "stall") : (working ? "work" : "train")) : "busy";
+      const pendingAi = j.ai && j.ai.status === "pending";
+      const what = r ? (a ? a.title : r.name)
+        : a ? a.title : (j.label || t("inUse")) + (pendingAi ? t("aiChecking") : "");
       // 다음 작업: 체인·큐로 실제 예약된 것과 문서상 계획만 있는 것을 구분한다.
       // count: 지금 단계 뒤에 남은 단계 수(다음 작업 포함). 2 이상이면 '외 N개'로 붙인다.
-      const next = a && a.next_short && gpu.state !== "free" ? { name: a.next_short, plan: a.next_source !== "chain",
+      const next = a && a.next_short ? { name: a.next_short, plan: a.next_source !== "chain",
         count: Array.isArray(a.rest_stages) ? a.rest_stages.length : 0 } : null;
       // 체인 전체 종료는 실제로 예약된 남은 단계가 있을 때만 — 계획은 시각을 약속하지 않는다.
       const rest = a && a.next_source === "chain" && num(a.rest_sec) ? a.rest_sec : null;
       const stages = a && Array.isArray(a.rest_stages) && a.rest_stages.length
         ? t("restStages") + a.rest_stages.map((x) => `${x.name}${num(x.sec) ? ` ${dur(x.sec)}` : ""}`).join(" → ") : null;
-      const tip = [a && a.summary, a && a.next && t("next") + a.next, r && r.dir,
-                   gpu.state_reason].filter(Boolean).join("\n");
+      const tip = [a && a.summary, a && a.next && t("next") + a.next, r && r.dir, j.label].filter(Boolean).join("\n");
       const etaTip = [stages, a && a.rest_basis && t("basis") + a.rest_basis].filter(Boolean).join("\n");
-      return { gpu, r, state, what, tip, next, rest, etaTip };
-    });
+      return { gpus: j.gpus, r, brief: j.brief || r, state, what, tip, next, rest, etaTip };
+    };
+    // 한 줄 = 작업 하나. 작업이 없는 GPU 는 빈 것끼리 묶고(GPU5–7 사용 가능), 프로세스를
+    // 못 찾은 점유는 GPU 마다 따로 쓴다.
+    let lines;
+    if (!m.online) lines = [{ gpus: [], state: "off", what: t("offline", ago(m.age_sec)), tip: "" }];
+    else {
+      lines = jobs.map(jobLine);
+      const covered = new Set(jobs.flatMap((j) => j.gpus));
+      const rest = gpus.filter((x) => !covered.has(x.index));
+      const free = rest.filter((x) => x.state === "free").map((x) => x.index);
+      for (const x of rest.filter((x) => x.state !== "free"))
+        lines.push({ gpus: [x.index], state: x.state === "busy" ? "busy" : "unknown",
+                     what: x.state_reason || t("inUse"), tip: x.state_reason || "" });
+      if (free.length) lines.push({ gpus: free, state: "free", what: t("available"), tip: "" });
+      if (!lines.length) lines.push({ gpus: [], state: "free", what: t("available"), tip: "" });
+    }
     const STATE_TEXT = t("st");
     // 상태는 글자 대신 점 하나로 — 학습 중은 맥박, 멈춤은 주황, 비었으면 초록.
     const dot = `<span class="sdot ${lines[0].state}" role="img" aria-label="${STATE_TEXT[lines[0].state]}"
                    title="${STATE_TEXT[lines[0].state]}"></span>`;
     const col = (f) => lines.map((l) => `<div>${f(l) || "&nbsp;"}</div>`).join("");
     const prog = `
-      <td class="work">${col((l) => `<span title="${esc(l.tip)}">${multi ? `GPU${esc(l.gpu.index)} ` : ""}${esc(l.what)}${
+      <td class="work">${col((l) => `<span title="${esc(l.tip)}">${multi && l.gpus.length ? `${esc(gpuLabel(l.gpus))} ` : ""}${esc(l.what)}${
         l.next ? `<span class="nx${l.next.plan ? " plan" : ""}"> → ${esc(l.next.name)}${
           l.next.count > 1 ? esc(t("more", l.next.count - 1)) : ""}${l.next.plan ? esc(t("planned")) : ""}</span>` : ""}</span>`)}</td>
       <td class="p-pc">${col((l) => l.r ? esc(pct(l.r.progress_pct, 0)) : "")}</td>
@@ -630,9 +689,14 @@ function machineTable(machines) {
         return `<div class="meter ${/stall/.test(l.state) ? "stall" : l.state === "pause" ? "idle" : ""}"><i style="width:${num(p) ? Math.min(100, p).toFixed(1) : 0}%"></i></div>`; })}</td>
       <td class="p-eta">${col((l) => !l.r ? ""
         : l.state === "pause" ? `<span class="sub">${esc(t("pausedFor", dur(l.r.log_age_sec)))}</span>`
-        : !/stall/.test(l.state) ? `<span class="sub" title="${esc(l.etaTip)}">${etaHtml(l.gpu.run.eta_sec, m.age_sec, l.rest)}</span>`
+        : !/stall/.test(l.state) ? `<span class="sub" title="${esc(l.etaTip)}">${etaHtml(l.brief.eta_sec, m.age_sec, l.rest)}</span>`
         // 프로세스는 GPU 를 물고 있는데 로그가 안 쌓인다 = 멈춤. 남은 시간은 계산할 수 없다.
         : `<span class="sub stall">${esc(t("stalledFor", dur(l.r.log_age_sec)))}</span>`)}</td>`;
+    // 상세는 고른 GPU 하나를 보여 준다. GPU 가 여러 장이면 맨 위에서 고른다.
+    const tabs = multi ? `<div class="gtabs" role="tablist">${gpus.map((x) => {
+      const busy = jobs.some((j) => j.gpus.includes(x.index));
+      return `<button class="gtab${x.index === g.index ? " on" : ""}" role="tab" aria-selected="${x.index === g.index}"
+        data-mid="${esc(m.machine_id)}" data-gi="${esc(x.index)}"><span class="gd${busy ? " on" : ""}"></span>GPU${esc(x.index)}</button>`; }).join("")}</div>` : "";
     const hw = [
       ["GPU", esc(g.name || "—")],
       ["VRAM", num(g.vram_total_mb) ? `${esc(gb(g.vram_total_mb, 1))}GB` : "—"],
@@ -647,13 +711,29 @@ function machineTable(machines) {
       [t("host"), `${esc(m.hostname || "—")} · ${esc(m.platform || "—")}`],
       [t("ai"), esc(aiStatusText(m.ai_status))],
     ];
-    // loss 는 GPU 에서 학습이 돌 때만 보인다. 추론 점유나 끝난 런이면 아예 뺀다.
-    const lossPart = !training.length ? ""
-      : (run.loss_history || []).length > 1
-      ? `<h4>${esc(run.name)} · loss ${esc(autoNum(run.loss_total))}${
+    // 고른 GPU 에서 도는 작업들. 식별했으면 설명을, 아니면 이름만 쓰고, '다시 식별' 버튼을 단다.
+    const aiOn = m.online && m.ai_status && m.ai_status.state !== "off";
+    const here = jobs.filter((j) => j.gpus.includes(g.index));
+    const boxes = here.map((j) => {
+      const a = aiOf(j), rs = j.id && redoState.get(j.id);
+      const redo = aiOn && j.id ? (rs && Date.now() - rs.at < 60000
+        ? `<span class="sub redo-note">${esc(rs.label)}</span>`
+        : `<button class="ghost redo" data-mid="${esc(m.machine_id)}" data-job="${esc(j.id)}">${esc(t("redo"))}</button>`) : "";
+      const head = `${multi ? `${esc(gpuLabel(j.gpus))} · ` : ""}${esc(a ? a.title : (j.label || t("inUse")))}`;
+      if (!a) return `<div class="aibox"><h4>${head}<span class="sub">${
+        j.ai && j.ai.status === "pending" ? esc(t("aiChecking")) : ""}</span>${redo}</h4></div>`;
+      return `<div class="aibox">
+        <h4>${head}<span class="sub">${esc(t("identified", ago(Date.now() / 1000 - a.identified_at)))}</span>${redo}</h4>
+        <p>${esc(a.summary || "")}</p>
+        ${a.next ? `<p class="sub">${esc(t("next") + a.next)}</p>` : ""}
+        ${a.log_path ? `<p class="sub">${esc(t("log"))}<code>${esc(a.log_path)}</code></p>` : ""}</div>`;
+    }).join("");
+    // loss 는 고른 GPU 에서 학습이 돌 때만 보인다. 추론 점유나 끝난 런이면 아예 뺀다.
+    const lj = lossJob(m), run = lj && lj.run;
+    const lossPart = !run ? ""
+      : `<h4>${esc(run.name)} · loss ${esc(autoNum(run.loss_total))}${
            num(run.step) ? ` · step ${esc(nf(run.step))}/${esc(nf(run.max_steps))}` : ""}</h4>
-         <div class="plot" data-loss="${esc(m.machine_id)}"></div>`
-      : "";  // loss 를 남기지 않는 작업(데이터 캡처 등)은 칸 자체를 뺀다
+         <div class="plot" data-loss="${esc(m.machine_id)}"></div>`;
     return `<tr class="mrow" data-id="${esc(m.machine_id)}" tabindex="0"
               aria-expanded="${open}"${shown(m) ? "" : ' style="opacity:.45"'}>
       <td class="caret">${open ? "▾" : "▸"}</td>
@@ -662,12 +742,9 @@ function machineTable(machines) {
       ${prog}
     </tr>
     <tr class="mdet" data-id="${esc(m.machine_id)}"${open ? "" : " hidden"}><td colspan="6">
+      ${tabs}
       <dl class="kv">${hw.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join("")}</dl>
-      ${(m.gpus || []).filter(aiOf).map((x) => `<div class="aibox">
-        <h4>${multi ? `GPU${esc(x.index)} · ` : ""}${esc(x.ai.title)}<span class="sub">${esc(t("identified", ago(Date.now() / 1000 - x.ai.identified_at)))}</span></h4>
-        <p>${esc(x.ai.summary || "")}</p>
-        ${x.ai.next ? `<p class="sub">${esc(t("next") + x.ai.next)}</p>` : ""}
-        ${x.ai.log_path ? `<p class="sub">${esc(t("log"))}<code>${esc(x.ai.log_path)}</code></p>` : ""}</div>`).join("")}
+      ${boxes}
       ${lossPart}
     </td></tr>`;
   }).join("");
@@ -712,8 +789,8 @@ function buildAlerts(machines) {
         out.push(["critical", `<b>${esc(who)}</b> ${esc(r.name)} ${esc(r.status)}`]);
     // GPU 를 문 프로세스가 그 런의 것일 때만 '멈춤'이다. 추론이 GPU 를 쓰는 동안
     // 옛 런 로그가 조용한 것은 경고거리가 아니다.
-    for (const { gpu, run: r } of trainingRuns(m))
-      if (r.status === "idle" && r.log_age_sec > 300 && !gpu.paused)  // 일시정지는 사람이 세운 것
+    for (const { run: r, paused } of jobsOf(m))
+      if (r && r.status === "idle" && r.log_age_sec > 300 && !paused)  // 일시정지는 사람이 세운 것
         out.push(["warning", `<b>${esc(who)}</b> ${esc(t("aStall", r.name, dur(r.log_age_sec)))}`]);
   }
   out.sort((a, b) => (a[0] === "critical" ? 0 : 1) - (b[0] === "critical" ? 0 : 1));
@@ -853,9 +930,9 @@ function render(data) {
   }
   for (const lbox of document.querySelectorAll(".plot[data-loss]")) {
     const m = machines.find((x) => x.machine_id === lbox.dataset.loss);
-    const tr = m && trainingRuns(m)[0];
-    if (!tr) continue;
-    const run = tr.run;
+    const lj = m && lossJob(m);
+    if (!lj) continue;
+    const run = lj.run;
     const line = { id: m.machine_id, name: run.name, color: colorOf.get(m.machine_id),
                    run, pts: (run.loss_history || []).filter((q) => num(q.step) && num(q.loss)) };
     const { svg, cols } = lossPlot([line], lbox.clientWidth);
@@ -922,6 +999,10 @@ function toggleMachine(id) {
   document.querySelector(`tr.mrow[data-id="${CSS.escape(id)}"]`)?.focus();
 }
 document.getElementById("panels").addEventListener("click", (ev) => {
+  const tab = ev.target.closest(".gtab");
+  if (tab) { selGpu.set(tab.dataset.mid, +tab.dataset.gi); render(lastData); return; }
+  const redo = ev.target.closest(".redo");
+  if (redo) { requestRedo(redo.dataset.mid, redo.dataset.job); return; }
   const tr = ev.target.closest("tr.mrow");
   // 행 안의 글을 드래그해 선택한 것이면 펼침 토글로 보지 않는다.
   if (tr && !selecting()) toggleMachine(tr.dataset.id);

@@ -76,6 +76,8 @@ def read_token(explicit, config_file=CONFIG_FILE):
 OFFLINE_AFTER_SEC = 12.0
 # 머신별 시계열 보관 개수(2초 주기 기준 약 10분).
 HISTORY_POINTS = 300
+# 같은 요청(머신·종류·작업)은 이 간격 안에 한 번만 받는다. AI 식별은 한 번에 $0.1~0.2 든다.
+COMMAND_COOLDOWN_SEC = 60.0
 # SSE 큐가 이만큼 밀리면 그 구독자는 느린 것으로 보고 끊는다.
 SSE_QUEUE_MAX = 32
 # 구독자가 이 시간 동안 한 덩어리도 못 받아 가면(잠든 노트북·죽은 연결) 끊는다.
@@ -94,6 +96,10 @@ class Store:
         self._lock = threading.Lock()
         self._machines: dict[str, dict] = {}
         self._history: dict[str, list[dict]] = {}
+        # 대시보드가 에이전트에게 보내는 요청(다시 식별 등). 에이전트는 NAT 뒤에 있을 수
+        # 있어 hub 가 먼저 연결하지 못한다 — 다음 보고의 응답에 실어 보낸다.
+        self._commands: dict[str, list[dict]] = {}
+        self._command_at: dict[tuple, float] = {}
         self._subscribers: list[queue.Queue] = []
         self.started_at = time.time()
         self.ingest_count = 0
@@ -123,6 +129,25 @@ class Store:
             return self.client_drop_count
 
     # -- 에이전트 입력 ----------------------------------------------------
+    def request(self, machine_id, command):
+        """대시보드의 요청을 맡아 둔다. 'ok' | 'unknown' | 'cooldown'."""
+        key = (machine_id, command.get("type"), command.get("job_id"))
+        now = time.time()
+        with self._lock:
+            if machine_id not in self._machines:
+                return "unknown"
+            if now - self._command_at.get(key, 0) < COMMAND_COOLDOWN_SEC:
+                return "cooldown"
+            self._command_at[key] = now
+            queue_ = self._commands.setdefault(machine_id, [])
+            if command not in queue_:
+                queue_.append(command)
+            return "ok"
+
+    def take_commands(self, machine_id):
+        with self._lock:
+            return self._commands.pop(machine_id, [])
+
     def ingest(self, snapshot):
         machine_id = str(snapshot.get("machine_id") or snapshot.get("label") or "unknown")
         now = time.time()
@@ -273,6 +298,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 라우팅 ----------------------------------------------------------
     def do_POST(self):  # noqa: N802
+        if self.path.rstrip("/") == "/api/reidentify":
+            self._post_reidentify()
+            return
         if self.path.rstrip("/") != "/ingest":
             self._send(404, json.dumps({"error": "not found"}))
             return
@@ -286,7 +314,32 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": f"bad payload: {exc}"}))
             return
         self.store.ingest(snapshot)
-        self._send(200, json.dumps({"ok": True}))
+        machine_id = str(snapshot.get("machine_id") or snapshot.get("label") or "unknown")
+        self._send(200, json.dumps({"ok": True, "commands": self.store.take_commands(machine_id)}))
+
+    def _post_reidentify(self):
+        """대시보드의 '다시 식별'. 인증이 없는 대시보드에서 오므로 두 가지로 막는다.
+        JSON 만 받는다(다른 웹페이지가 폼·단순 요청으로 몰래 보내지 못한다), Origin 이
+        있으면 이 hub 여야 한다. 같은 작업은 COMMAND_COOLDOWN_SEC 에 한 번만 받는다."""
+        origin = self.headers.get("Origin")
+        if origin and origin.split("://", 1)[-1] != (self.headers.get("Host") or ""):
+            self._send(403, json.dumps({"error": "origin"}))
+            return
+        if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            self._send(415, json.dumps({"error": "json only"}))
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 4096:
+                raise ValueError("too large")
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            machine_id, job_id = str(body["machine_id"])[:200], str(body["job_id"])[:200]
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, json.dumps({"error": "bad request"}))
+            return
+        result = self.store.request(machine_id, {"type": "reidentify", "job_id": job_id})
+        code = {"ok": 200, "unknown": 404, "cooldown": 429}[result]
+        self._send(code, json.dumps({"ok": result == "ok", "result": result}))
 
     def do_GET(self):  # noqa: N802
         path, _, query = self.path.partition("?")
