@@ -96,7 +96,7 @@ button.ghost:hover { background: var(--hover); color: var(--ink); }
 
 /* ---------- 패널 격자 (Grafana 식) ---------- */
 main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
-  display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(370px, 1fr)); }
+  display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(370px, 100%), 1fr)); }
 .panel { background: var(--surface); border: 1px solid var(--ring); box-shadow: var(--shadow);
   border-radius: 12px; padding: 11px 13px 9px; min-width: 0; }
 .panel.wide { grid-column: 1 / -1; }

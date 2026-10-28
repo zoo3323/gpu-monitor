@@ -106,7 +106,7 @@ fetch() {  # URL DEST — 받는 중에 도는 서비스가 반쯤 쓴 파일을
 }
 check_gpu() {
   if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
-    say "  GPU: $(nvidia-smi -L | sed 's/ (UUID.*//' | paste -sd ',' -)"
+    say "  GPU: $(nvidia-smi -L | sed 's/ (UUID.*//' | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')"
   else
     warn "nvidia-smi 가 안 된다 — 이 서버는 CPU·메모리·디스크만 보인다"
   fi
