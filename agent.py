@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import collections
 import glob
+import hashlib
 import json
 import math
 import os
@@ -48,7 +49,7 @@ WINDOWS = os.name == "nt"
 # 윈도우에서 창 없이(pythonw) 돌 때 nvidia-smi·powershell·claude 가 콘솔 창을 띄우지 않게 한다.
 NOWIN = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if WINDOWS else {}
 
-AGENT_VERSION = "2.17.0"
+AGENT_VERSION = "2.17.2"
 
 # 화면에 보이는 문구의 언어: en(기본) | ko. 에이전트가 만드는 문구(빈 GPU 사유·AI 상태)와
 # AI 가 쓰는 작업 설명이 이 언어로 나온다. main() 이 --lang / $MONITOR_LANG 으로 정한다.
@@ -1369,23 +1370,30 @@ class CpuJobs:
             launcher = _launch_key(h.get("ppid"), proc_stat, _read_cmdline) if h.get("cmdline") else None
             key = ((launcher, h.get("user"), h.get("cwd"), _pool_sig(h["cmdline"]))
                    if launcher is not None else ("solo", g["pgid"]))
+            if launcher == "container":  # 이미지가 다르면 다른 서비스다
+                key += ((container_info(h["pid"]) or {}).get("image"),)
             pools.setdefault(key, []).append(g)
-        clusters = []
-        for gs in pools.values():
+        clusters = []   # (고정 키 또는 None, 그룹들)
+        for key, gs in pools.items():
             gs.sort(key=lambda g: g["head"].get("start_ticks") or 0)
+            if key[0] == "container":
+                # 벤치처럼 컨테이너를 몇 분마다 새로 띄워도 같은 이미지·명령이면 한 작업이다.
+                # 이름(id)을 그 조합으로 고정해, 묶음이 바뀔 때마다 AI 에게 다시 묻지 않는다.
+                clusters.append((hashlib.sha1(repr(key).encode()).hexdigest()[:12], gs))
+                continue
             cur = [gs[0]]
             for g in gs[1:]:
                 if ((g["head"].get("start_ticks") or 0) - (cur[-1]["head"].get("start_ticks") or 0)
                         <= POOL_START_SEC * _CLK_TCK):
                     cur.append(g)
                 else:
-                    clusters.append(cur)
+                    clusters.append((None, cur))
                     cur = [g]
-            clusters.append(cur)
+            clusters.append((None, cur))
         jobs, seen = [], set()
-        for cl in clusters:
+        for fixed, cl in clusters:
             lead = cl[0]
-            cid = lead["pgid"]
+            cid = f"ctr-{fixed}" if fixed else lead["pgid"]
             recent, minute = sum(g["recent"] for g in cl), sum(g["minute"] for g in cl)
             if minute < CPU_JOB_KEEP_CORES:
                 continue
@@ -1407,11 +1415,12 @@ class CpuJobs:
                         have.add(pid)
             for info in procs:
                 info["cpu_pct"] = round(self.rate.get(info["pid"], 0) * 100)
+            job_id = f"cpu-ctr-{fixed}" if fixed else f"cpu-{leader['pid']}-{leader.get('start_ticks')}"
             jobs.append({
-                "id": f"cpu-{leader['pid']}-{leader.get('start_ticks')}",
-                "gpus": [], "pids": busy or [leader["pid"]], "vram_mb": 0.0,
+                "id": job_id, "gpus": [], "pids": busy or [leader["pid"]], "vram_mb": 0.0,
                 "cpu": True, "cpu_cores": round(recent, 1),
                 "_leader": leader, "_procs": procs,
+                **({"_ai_key": job_id} if fixed else {}),
             })
         for cid in list(self.busy_since):
             if cid not in seen:
@@ -2305,6 +2314,9 @@ AI_DENY_READ = (
     "~/.huggingface/token", "~/.bash_history", "~/.zsh_history", "~/.python_history",
     "//**/.env", "//**/.env.*", "//**/monitor.env", "//**/*.pem", "//**/*.key",
     "//**/id_rsa*", "//**/id_ed25519*", "//**/id_ecdsa*")
+# 홈 기준(~/…) 규칙은 /proc/<pid>/root/home/… 처럼 다른 경로로 돌아가면 걸리지 않는다.
+# 컨테이너 안 파일을 /proc/<pid>/root 로 읽게 하므로, 같은 이름을 어느 경로 아래서든 막는다.
+AI_DENY_READ += tuple("//**/" + p[2:] for p in AI_DENY_READ if p.startswith("~/"))
 AI_DENY = "Edit,Write,NotebookEdit," + ",".join(f"Read({p})" for p in AI_DENY_READ)
 # 있으면 붙이는 옵션. 옛 Claude Code 에 없는 옵션을 넘기면 실행 자체가 실패하므로
 # --help 에 보이는 것만 쓴다.
@@ -2374,7 +2386,11 @@ Steps:
    (b) remaining steps / the current stage's speed (same model and resolution),
    (c) for short stages such as evaluation or scoring, the duration of a previous run.
    If there is no basis, null.
-Only read files. Do not modify, run or stop anything.
+Only read files. Do not modify, run or stop anything. Bash runs only single ls, ps, readlink, stat or wc
+commands (no cd, ;, &&, | or variables); use Read, Glob and Grep for everything else.
+Always finish with the JSON object below, even if you could find out little: then fill it from the command
+line, the container image and the parent processes, use null for anything unknown, and say in the summary
+what you could not check. An answer without the JSON object is discarded.
 
 Write every human-readable value (title, summary, stage, next, next_short, rest_stages names, rest_basis)
 in {language}.
@@ -2395,7 +2411,7 @@ Output exactly one JSON object as the final answer (no explanation, no code fenc
   "progress": only for jobs without a step log, how to count progress, otherwise null.
     {{"kind": "lines", "path": "absolute path of a file that grows by one line per unit", "total": target count of the current stage}}
     or {{"kind": "matches", "path": "absolute path of a log that writes one line per finished unit among other lines", "pattern": "Python regex that only those lines match (e.g. rc=\\d+)", "total": target count of the current stage}}
-    or {{"kind": "files", "path": "absolute path of the folder where one output file appears per finished unit", "pattern": "glob that matches only those files (e.g. CAM01_*.json)", "total": target count of the current stage}}
+    or {{"kind": "files", "path": "absolute path of the folder where one output file or folder appears per finished unit", "pattern": "glob that matches only those (e.g. CAM01_*.json or */result.json)", "total": target count of the current stage, "since_start": true only if the folder also holds results of earlier runs, so that only files written after this job started count}}
     or {{"kind": "regex", "path": "absolute path of the log file", "pattern": "Python regex with one group capturing the progress count (e.g. records=(\\d+))", "total": target count of the current stage}}}}
 """
 # 답의 언어. 캐시에 언어를 같이 남겨, 언어를 바꾸면 다시 묻는다.
@@ -2417,6 +2433,58 @@ def _read_cmdline(pid):
             return fh.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
     except OSError:
         return None
+
+
+_CONTAINER_ID = re.compile(r"(?:docker|libpod|cri-containerd|crio)[-/]([0-9a-f]{64})")
+_CONTAINER_INFO: dict[str, dict] = {}
+
+
+def container_info(pid):
+    """프로세스가 컨테이너 안에서 돌면 {"id", "name", "image", "compose_dir", "mounts"}, 아니면 None.
+    mounts: [(컨테이너 안 경로, 이 머신 경로)] — 이 머신에서 읽을 수 있는 것만.
+    이름·이미지·마운트는 docker 가 있고 쓸 수 있을 때만 나온다(컨테이너마다 한 번 묻는다)."""
+    if WINDOWS:
+        return None
+    try:
+        with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8", errors="replace") as fh:
+            match = _CONTAINER_ID.search(fh.read())
+    except OSError:
+        return None
+    if not match:
+        return None
+    cid = match.group(1)
+    if cid not in _CONTAINER_INFO:
+        info = {"id": cid[:12], "name": None, "image": None, "compose_dir": None, "mounts": []}
+        if shutil.which("docker"):
+            try:
+                out = subprocess.run(["docker", "inspect", cid], capture_output=True, text=True,
+                                     timeout=3, **NOWIN).stdout
+                data = (json.loads(out) or [{}])[0]
+                labels = (data.get("Config") or {}).get("Labels") or {}
+                info.update(
+                    name=(data.get("Name") or "").lstrip("/") or None,
+                    image=(data.get("Config") or {}).get("Image"),
+                    compose_dir=labels.get("com.docker.compose.project.working_dir"),
+                    mounts=sorted(((m.get("Destination"), m.get("Source")) for m in data.get("Mounts") or []
+                                   if m.get("Destination") and m.get("Source")
+                                   and os.access(m["Source"], os.R_OK)),
+                                  key=lambda m: -len(m[0])))
+            except (OSError, subprocess.SubprocessError, ValueError, IndexError, AttributeError):
+                pass
+        if len(_CONTAINER_INFO) > 500:
+            _CONTAINER_INFO.clear()
+        _CONTAINER_INFO[cid] = info
+    return _CONTAINER_INFO[cid]
+
+
+def host_path(box, path):
+    """컨테이너 안 경로를 이 머신 경로로(연결된 폴더·파일일 때만). 아니면 None."""
+    if not (box and path):
+        return None
+    for inside, outside in box.get("mounts") or ():
+        if path == inside or path.startswith(inside.rstrip("/") + "/"):
+            return outside + path[len(inside):]
+    return None
 
 
 def _parent_chain(pid, depth=4):
@@ -2457,8 +2525,9 @@ def gpu_leader(gpu):
 
 PROGRESS_WINDOW_SEC = 600.0   # 속도는 최근 이만큼의 증가로 잰다
 PROGRESS_MIN_SPAN_SEC = 45.0  # 이만큼은 지켜봐야 속도를 낸다
-# 개수로 세는 진행은 하나 끝내는 데 몇 분씩 걸리기도 한다. 늘지 않아도 지금까지 본 증가 간격의
-# 2.5배(최소 RUNNING_STALE_SEC)까지는 정상이다. 아직 한 번도 늘지 않았으면 이만큼 기다린다.
+# 개수로 세는 진행은 하나 끝내는 데 몇 분, 몇십 분씩 걸리기도 한다. 늘지 않아도 지금까지 본 증가 간격의
+# 2.5배(최소 RUNNING_STALE_SEC)까지는 정상이다. 간격을 아직 못 봤으면 평균 단위 시간의 2.5배와
+# 이 값 중 큰 것까지 기다리고, 하나도 안 끝났으면 멈춤으로 보지 않는다(_first_stale).
 COUNTER_STALE_SEC = 600.0
 
 
@@ -2556,14 +2625,24 @@ class ProgressCounter:
         pattern = pattern if isinstance(pattern, str) and len(pattern) <= 200 else None
         if kind == "files":
             # 결과 파일 개수. 파일 시각이 남아 있으니 에이전트가 방금 켜졌어도 속도를 바로 낸다.
-            if not (isinstance(path, str) and os.path.isdir(path) and pattern):
+            # 지난 실행의 결과가 섞인 폴더면(AI 가 since_start 로 알려 준다) 이번 실행 뒤의 것만 센다.
+            if not (isinstance(path, str) and os.path.isabs(path) and pattern):
                 return None
-            times = self._file_times(path, pattern, since)
-            start = since if since else (times[0] if times else now)
-            gaps = [b - a for a, b in zip([start] + times[:-1], times)]
-            rate = len(times) / (now - start) if times and now - start >= 60 else None
-            stale_after = max(RUNNING_STALE_SEC, 2.5 * max(gaps)) if gaps else COUNTER_STALE_SEC
-            return len(times), rate, now - (times[-1] if times else start), False, stale_after
+            fresh = bool(recipe.get("since_start"))
+            # 결과 폴더는 첫 결과를 쓸 때 생기기도 한다. 아직 없으면 0개다.
+            times = self._file_times(path, pattern, since if fresh else None) if os.path.isdir(path) else []
+            n = len(times)
+            # 속도: 작업 시작 시각을 알고 그게 첫 결과보다 앞이면 '개수 / 시작부터 지난 시간'.
+            # 아니면(에이전트가 늦게 봤다) 결과 파일 사이 간격으로 잰다 — 첫 단위 시간이 빠져 부풀지 않게.
+            start = since if since and (fresh or not times or since <= times[0]) else None
+            if start:
+                rate = n / (now - start) if n and now - start >= 60 else None
+            else:
+                rate = (n - 1) / (times[-1] - times[0]) if n >= 2 and times[-1] - times[0] >= 60 else None
+            gaps = [b - a for a, b in zip(([start] if start else []) + times[:-1], times[0 if start else 1:])]
+            stale_after = (max(RUNNING_STALE_SEC, 2.5 * max(gaps)) if gaps
+                           else self._first_stale(n, since, now))
+            return n, rate, now - (times[-1] if times else (start or now)), False, stale_after
         if not isinstance(path, str) or not os.path.isfile(path):
             return None
         if kind == "lines":
@@ -2592,8 +2671,19 @@ class ProgressCounter:
         t0, d0 = q[0]
         rate = (done - d0) / (now - t0) if now - t0 >= PROGRESS_MIN_SPAN_SEC and done > d0 else None
         gaps = self.gaps.get(key)
-        stale_after = (max(RUNNING_STALE_SEC, 2.5 * max(gaps)) if gaps else COUNTER_STALE_SEC)
+        stale_after = (max(RUNNING_STALE_SEC, 2.5 * max(gaps)) if gaps
+                       else self._first_stale(done, since, now))
         return done, rate, now - self.changed_at.get(key, now), reset, stale_after
+
+    @staticmethod
+    def _first_stale(done, since, now):
+        """증가 간격을 아직 못 봤을 때 멈춤으로 볼 시간. 하나도 안 끝났으면 멈춤이라 할 근거가 없다
+        (한 단위가 한 시간씩 걸리는 작업도 있다). 몇 개 끝났으면 지금까지 평균 단위 시간의 2.5배."""
+        if not done:
+            return math.inf
+        if since and now > since:
+            return max(COUNTER_STALE_SEC, 2.5 * (now - since) / done)
+        return COUNTER_STALE_SEC
 
 
 class AiIdentifier:
@@ -2757,16 +2847,31 @@ class AiIdentifier:
         return f"{gpu.get('uuid') or gpu.get('index')}-{leader['pid']}-{start}"
 
     def _facts(self, leader, job_gpus=(), nprocs=1, cpu=None):
+        # 컨테이너 안 경로는 이 머신에 없다. 연결된 폴더면 이 머신 경로로 바꿔 준다.
+        box = container_info(leader["pid"])
+        here = (lambda path: host_path(box, path) or path) if box else (lambda path: path)
         lines = [f"pid {leader['pid']} (user {leader.get('user')}, "
                  f"running for {int(leader.get('elapsed_sec') or 0)}s)",
                  f"command line: {leader.get('cmdline')}",
-                 f"working directory: {leader.get('cwd')}"]
-        opened = [p for p in process_paths({"pid": leader["pid"]})]
+                 f"working directory: {here(leader.get('cwd'))}"]
+        opened = [here(p) for p in process_paths({"pid": leader["pid"]})]
         if opened:
             lines.append("open files: " + ", ".join(opened[:20]))
         chain = _parent_chain(leader["pid"])
         if chain:
             lines.append("parent processes:\n  " + "\n  ".join(chain))
+        if box:
+            about = ", ".join(x for x in (box.get("name") and f"name {box['name']}",
+                                          box.get("image") and f"image {box['image']}") if x)
+            lines.append(f"this process runs inside a container{f' ({about})' if about else ''}")
+            if box.get("mounts"):
+                lines.append("folders mounted into the container (inside → on this machine; the paths above are "
+                             "already translated where they fall in one):\n  " + "\n  ".join(
+                                 f"{a} → {b}" for a, b in sorted(box["mounts"])[:12]))
+            else:
+                lines.append("its files are inside the container image and can't be read from this machine")
+            if box.get("compose_dir"):
+                lines.append(f"its docker compose project folder on this machine: {box['compose_dir']}")
         if cpu:
             busy = [p for p in cpu["procs"] if p["pid"] != leader["pid"]]
             lines.append(f"{nprocs} processes in this job are busy, about {cpu['cores']:.1f} CPU cores in total")
@@ -2801,7 +2906,7 @@ class AiIdentifier:
                  "--allowedTools", AI_ALLOW, "--disallowedTools", AI_DENY],
                 capture_output=True, text=True, timeout=AI_TIMEOUT_SEC,
                 cwd=leader.get("cwd") if leader.get("cwd") and os.path.isdir(leader["cwd"])
-                else os.path.expanduser("~"),
+                else host_path(container_info(leader["pid"]), leader.get("cwd")) or os.path.expanduser("~"),
                 stdin=subprocess.DEVNULL,
                 env=self._env(), **NOWIN)
             try:
@@ -2897,7 +3002,8 @@ class AiIdentifier:
         for job in jobs:
             leader = job["_leader"]
             primary = by_index.get(job["gpus"][0]) if job["gpus"] else None
-            key = self.fingerprint(primary or {"index": "cpu" if job.get("cpu") else "x"}, leader)
+            key = job.get("_ai_key") or self.fingerprint(
+                primary or {"index": "cpu" if job.get("cpu") else "x"}, leader)
             self.job_keys[job["id"]] = key
             alive.add(key)
             self.first_seen.setdefault(key, now)
@@ -2910,7 +3016,7 @@ class AiIdentifier:
                 "kind", "title", "summary", "stage", "next", "next_short", "next_source",
                 "rest_sec", "rest_stages", "rest_basis", "run_dir", "log_path",
                 "identified_at")}}
-            run = self._run_for(result, runs, now, leader.get("started_at"))
+            run = self._run_for(result, runs, now, job.get("_since") or leader.get("started_at"))
             if id(result) in self._stale:
                 self._stale.discard(id(result))
                 self.forget(key)
