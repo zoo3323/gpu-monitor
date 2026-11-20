@@ -4,7 +4,8 @@
 
 ## Jobs and GPUs
 
-- One row is one job. A training run spread over several GPUs (DDP, torchrun, mp.spawn, DataParallel) is one row such as `GPU0–3`, identified once. So are parallel workers that one script, `xargs` or Python runner starts together with the same command except for numbers (`--worker 3`, `--shard 2`). Two different jobs on one GPU are two rows, and so are jobs you start separately from a terminal. Idle GPUs are grouped (`GPU5–7 available`).
+- One row is one job. A training run spread over several GPUs (DDP, torchrun, mp.spawn, DataParallel) is one row such as `GPU0–3`, identified once. So are parallel workers that one script, `xargs` or Python runner starts together with the same command except for numbers (`--worker 3`, `--shard 2`), and containers started together by `docker compose`. Two different jobs on one GPU are two rows, and so are jobs you start separately from a terminal. Idle GPUs are grouped (`GPU5–7 available`).
+- Jobs that keep the CPU busy without a GPU (at least half a core for 30 s) show up next to the machine's GPU status as one `CPU` summary (`CPU name +1 more`) with a purple progress bar and end time when the job's progress can be read; otherwise the cores it uses. Open the machine to see each one. Everything one script started counts as one job, even as its workers come and go, and the AI identifies it the same way. Desktop apps, system services and coding agents (Claude Code, Codex, VS Code server) are left out. Linux and WSL2 only for now.
 - Open a machine to pick a GPU. The detail (specs, job description, loss curve) and the charts at the top follow the picked GPU.
 - **Re-identify** next to a job description asks the AI again — when it named the job wrong, or after you logged in to Claude. A job can be re-identified once a minute.
 

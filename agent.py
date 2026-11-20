@@ -48,7 +48,7 @@ WINDOWS = os.name == "nt"
 # 윈도우에서 창 없이(pythonw) 돌 때 nvidia-smi·powershell·claude 가 콘솔 창을 띄우지 않게 한다.
 NOWIN = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if WINDOWS else {}
 
-AGENT_VERSION = "2.15.0"
+AGENT_VERSION = "2.17.0"
 
 # 화면에 보이는 문구의 언어: en(기본) | ko. 에이전트가 만드는 문구(빈 GPU 사유·AI 상태)와
 # AI 가 쓰는 작업 설명이 이 언어로 나온다. main() 이 --lang / $MONITOR_LANG 으로 정한다.
@@ -1034,6 +1034,29 @@ def _script_shell(cmdline):
     return "-c" in args or any(not a.startswith(("-", "+")) for a in args)
 
 
+# 컨테이너는 하나마다 런처(shim)가 따로 뜬다. 'docker compose up' 으로 함께 띄운 컨테이너들은
+# 런처가 달라도 같은 곳에서 띄운 것으로 본다. 컨테이너 안의 초기화 프로그램은 한 단계 건너뛴다.
+CONTAINER_SHIMS = ("containerd-shim", "conmon", "docker-containe")
+CONTAINER_INITS = {"tini", "dumb-init", "docker-init", "catatonit"}
+
+
+def _launch_key(ppid, stat, cmdline):
+    """'함께 띄웠나' 를 따질 런처. 컨테이너 런처면 "container", 스크립트·xargs·파이썬 러너
+    같은 런처면 그 pid, 터미널의 대화형 셸·세션 관리자처럼 따로따로 띄우는 곳이면 None."""
+    parent = stat(ppid) if ppid and ppid > 1 else None
+    if parent and parent[1] in CONTAINER_INITS:
+        grand = stat(parent[0]) if parent[0] > 1 else None
+        if grand and grand[1].startswith(CONTAINER_SHIMS):
+            return "container"
+    if not parent:
+        return None
+    if parent[1].startswith(CONTAINER_SHIMS):
+        return "container"
+    if parent[1] in SESSION_COMMS and not (parent[1] in SHELL_COMMS and _script_shell(cmdline(ppid))):
+        return None
+    return ppid
+
+
 def group_jobs(gpus, stat=proc_stat, dist=dist_key, cmdline=None):
     """GPU 컴퓨트 점유자를 작업으로 묶는다. 작업 목록을 GPU 번호 순으로 돌려준다.
 
@@ -1046,7 +1069,8 @@ def group_jobs(gpus, stat=proc_stat, dist=dist_key, cmdline=None):
       5. 일꾼 묶음: 같은 부모가 같은 디렉터리에서 번호만 다른 명령(_pool_sig)으로 띄웠고
          (가) 프로세스 그룹이 같거나 — 셸 스크립트·xargs 가 작업 제어 없이 함께 띄웠다,
          (나) 부모가 런처(스크립트 셸·파이썬 러너 등)이고 POOL_START_SEC 안에 잇달아 떴다
-              — 일꾼마다 setsid 로 그룹을 따로 연 경우.
+              — 일꾼마다 setsid 로 그룹을 따로 연 경우. 컨테이너 런처는 컨테이너마다 따로
+              뜨지만 하나로 본다(docker compose 로 함께 띄운 컨테이너 묶음).
          터미널에서 따로 띄운 작업은 셸의 작업 제어가 작업마다 그룹을 새로 주고 부모가
          대화형 셸이라 걸리지 않는다. 그룹을 모르는 윈도우는 이 규칙을 쓰지 않는다.
     """
@@ -1112,20 +1136,22 @@ def group_jobs(gpus, stat=proc_stat, dist=dist_key, cmdline=None):
         if WINDOWS or not st or st[0] <= 1 or not p.get("cmdline"):
             continue
         pools.setdefault((st[0], p.get("cwd"), _pool_sig(p["cmdline"])), []).append(pid)
-    for (ppid, _, _), pids in pools.items():
-        if len(pids) < 2:
-            continue
-        by_group: dict[int, list] = {}                    # (가) 같은 프로세스 그룹
-        for pid in pids:
-            if procs[pid].get("pgid") is not None:
-                by_group.setdefault(procs[pid]["pgid"], []).append(pid)
-        for same in by_group.values():
-            for pid in same[1:]:
-                union(same[0], pid)
-        parent = stat(ppid)                               # (나) 런처가 잇달아 띄웠다
-        if not parent or (parent[1] in SESSION_COMMS
-                          and not (parent[1] in SHELL_COMMS and _script_shell(cmdline(ppid)))):
-            continue
+    launched: dict[tuple, list] = {}
+    keys_of: dict[int, object] = {}
+    for (ppid, cwd, sig), pids in pools.items():
+        if len(pids) >= 2:
+            by_group: dict[int, list] = {}                # (가) 같은 프로세스 그룹
+            for pid in pids:
+                if procs[pid].get("pgid") is not None:
+                    by_group.setdefault(procs[pid]["pgid"], []).append(pid)
+            for same in by_group.values():
+                for pid in same[1:]:
+                    union(same[0], pid)
+        if ppid not in keys_of:
+            keys_of[ppid] = _launch_key(ppid, stat, cmdline)
+        if keys_of[ppid] is not None:                     # (나) 런처가 잇달아 띄웠다
+            launched.setdefault((keys_of[ppid], cwd, sig), []).extend(pids)
+    for pids in launched.values():
         timed = sorted((procs[pid]["start_ticks"], pid) for pid in pids
                        if procs[pid].get("start_ticks") is not None)
         for (t0, a), (t1, b) in zip(timed, timed[1:]):
@@ -1179,7 +1205,221 @@ def job_public(job):
         "label": label, "paused": leader.get("state") == "T",
         "leader": {k: leader.get(k) for k in ("pid", "name", "user", "state", "elapsed_sec")},
         "ai": job.get("ai"), "run": job.get("run"),
+        "cpu": bool(job.get("cpu")), "cpu_cores": job.get("cpu_cores"),
     }
+
+
+# --------------------------------------------------------------------------
+# CPU 작업 — GPU 는 안 쓰지만 CPU 를 붙잡고 있는 작업
+#
+# 셸 스크립트가 띄운 파이프라인은 일꾼이 몇 분마다 새로 떠도 프로세스 그룹은 그대로다
+# (작업 제어가 없는 셸은 자식을 자기 그룹에 둔다). 터미널에서 띄운 명령은 셸이 그룹을
+# 따로 준다. 그래서 CPU 작업은 프로세스 그룹 하나로 세고, 대표는 그룹을 연 프로세스
+# (대개 스크립트)다. 일꾼이 바뀌어도 줄과 AI 답이 그대로 남는다.
+# 리눅스·WSL 만 본다(/proc). 윈도우는 아직 GPU 작업만 보인다.
+# --------------------------------------------------------------------------
+CPU_SCAN_SEC = 6.0          # /proc 전체를 이 간격으로 훑는다(한 번에 수 ms)
+CPU_JOB_MIN_CORES = 0.5     # 최근 30초 평균으로 코어 반 개 이상을
+CPU_JOB_MIN_SEC = 30.0      # 이만큼 이어서 써야 보인다(잠깐 도는 설치·빌드 거르기)
+CPU_JOB_KEEP_CORES = 0.2    # 한 번 보이면 1분 평균이 이 아래로 떨어질 때까지 둔다(단계 사이 쉼)
+CPU_JOB_MAX = 6             # 한 머신에 보일 CPU 작업 수(많이 쓰는 순)
+# 맡긴 작업이 아닌 것: 데스크톱·브라우저·시스템 서비스·들여다보는 도구·코딩 에이전트
+CPU_IGNORE = {
+    "Xorg", "Xwayland", "gnome-shell", "kwin_x11", "kwin_wayland", "plasmashell", "mutter",
+    "xfwm4", "chrome", "chromium", "chromium-browse", "firefox", "firefox-bin", "Web Content",
+    "Isolated Web Co", "code", "cursor", "slack", "discord", "zoom",
+    "sshd", "systemd", "dbus-daemon", "dockerd", "containerd", "snapd", "packagekitd",
+    "tailscaled", "NetworkManager", "rsyslogd", "irqbalance", "polkitd", "fwupd", "thermald",
+    "unattended-upgr", "pipewire", "pulseaudio", "wireplumber", "nvidia-persiste", "tmux: server",
+    "top", "htop", "btop", "nvtop", "glances", "claude", "codex",
+}
+CPU_IGNORE_PREFIX = ("gsd-", "gnome-", "tracker-", "systemd-", "evolution-")
+CPU_IGNORE_CMD = re.compile(r"/\.(vscode|cursor|windsurf)-server/")
+
+
+class CpuJobs:
+    """프로세스 그룹마다 최근 CPU 사용량을 재고, 오래 바쁜 그룹을 작업으로 낸다."""
+
+    def __init__(self):
+        self.first_scan = None
+        self.scanned_at = None
+        self.uptime_at = None
+        self.prev: dict[int, tuple] = {}     # pid → (시작 틱, 누적 CPU 틱)
+        self.procs: dict[int, tuple] = {}    # pid → (comm, ppid, pgid) — 마지막 훑기
+        self.rate: dict[int, float] = {}     # pid → 마지막 간격의 코어 수
+        self.hist: dict[int, collections.deque] = {}   # pgid → (시각, CPU 틱)
+        self.busy_since: dict[int, float] = {}
+        self.shown: set[int] = set()
+        self.ignored: dict[int, bool] = {}   # pid → 무시할 프로세스인가(명령줄을 한 번만 읽는다)
+        self._made: list = []                # 마지막 훑기로 만든 작업 목록
+        self._made_at = None
+
+    def _ignore(self, pid, comm):
+        if comm in CPU_IGNORE or comm.startswith(CPU_IGNORE_PREFIX):
+            return True
+        if comm.startswith("node"):
+            if pid not in self.ignored:
+                self.ignored[pid] = bool(CPU_IGNORE_CMD.search(_read_cmdline(pid) or ""))
+            return self.ignored[pid]
+        return False
+
+    def scan(self, now):
+        if WINDOWS or (self.scanned_at is not None and now - self.scanned_at < CPU_SCAN_SEC):
+            return
+        try:
+            with open("/proc/uptime", "r", encoding="ascii") as fh:
+                uptime = float(fh.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            return
+        dt = (now - self.scanned_at) if self.scanned_at is not None else None
+        cur, used, rate = {}, {}, {}
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as fh:
+                    raw = fh.read().decode("utf-8", "replace")
+                comm = raw[raw.index("(") + 1:raw.rindex(")")]
+                f = raw[raw.rindex(")") + 2:].split()
+                ppid, pgid, start = int(f[1]), int(f[2]), int(f[19])
+                ticks = int(f[11]) + int(f[12])
+            except (OSError, ValueError, IndexError):
+                continue
+            pid = int(name)
+            cur[pid] = (start, ticks)
+            if pgid == 0:  # 커널 스레드
+                continue
+            self.procs[pid] = (comm, ppid, pgid)
+            old = self.prev.get(pid)
+            if old and old[0] == start:
+                d = ticks - old[1]
+            elif self.uptime_at is not None and start / _CLK_TCK >= self.uptime_at:
+                d = ticks  # 지난 훑기 뒤에 뜬 프로세스
+            else:
+                d = 0
+            if d > 0 and not self._ignore(pid, comm):
+                used[pgid] = used.get(pgid, 0) + d
+                if dt:
+                    rate[pid] = d / _CLK_TCK / dt
+        for pid in list(self.procs):
+            if pid not in cur:
+                self.procs.pop(pid, None)
+                self.ignored.pop(pid, None)
+        self.prev, self.rate = cur, rate
+        if self.scanned_at is not None:
+            for pgid, d in used.items():
+                self.hist.setdefault(pgid, collections.deque()).append((now, d))
+        for pgid in list(self.hist):
+            h = self.hist[pgid]
+            while h and now - h[0][0] > 120:
+                h.popleft()
+            if not h:
+                self.hist.pop(pgid)
+        if self.first_scan is None:
+            self.first_scan = now
+        self.scanned_at, self.uptime_at = now, uptime
+
+    def cores(self, pgid, window):
+        """마지막 훑기까지 window 초 동안의 평균 코어 수. 훑기 사이에 출렁이지 않게 훑은 시각 기준이다."""
+        at = self.scanned_at or 0
+        span = min(window, at - (self.first_scan or at))
+        if span <= 0:
+            return 0.0
+        return sum(d for t, d in self.hist.get(pgid, ()) if at - t < window) / _CLK_TCK / span
+
+    def collect(self, now, skip_pgids, boot_time=None):
+        """작업 목록(group_jobs 와 같은 모양). skip_pgids: GPU 작업이 든 그룹 — 그쪽에서 보인다.
+
+        1. 프로세스 그룹마다 최근 사용량을 잰다.
+        2. 같은 런처가 같은 명령·같은 폴더로 POOL_START_SEC 안에 잇달아 띄운 그룹들은 합친다
+           (일꾼마다 setsid 로 띄운 묶음, docker compose 로 함께 띄운 컨테이너 묶음).
+           하나하나는 작아도 합치면 큰 작업이 보이게, 기준과 비교하기 전에 합친다.
+        3. 합친 작업이 오래 바쁘면 낸다. 훑기(6초)마다 한 번 계산하고 그사이에는 그대로 낸다.
+        """
+        self.scan(now)
+        if self.first_scan is None or now - self.first_scan < 15:
+            return []
+        if self._made_at == self.scanned_at:
+            return [dict(j) for j in self._made]
+        skip = set(skip_pgids)
+        try:
+            skip.add(os.getpgrp())  # 모니터 자신과 AI 식별(claude -p)
+        except OSError:
+            pass
+        members: dict[int, list] = {}
+        for pid, (_, _, pgid) in self.procs.items():
+            members.setdefault(pgid, []).append(pid)
+        groups = []
+        for pgid in self.hist:
+            if pgid in skip or pgid not in members:
+                continue
+            minute = self.cores(pgid, 60)
+            if minute < 0.02:  # 거의 쉬는 그룹은 볼 것도 없다
+                continue
+            busy = [pid for pid in members[pgid] if self.rate.get(pid, 0) >= 0.05]
+            head = pgid if pgid in self.procs and not self._ignore(pgid, self.procs[pgid][0]) else (
+                max(busy, key=lambda pid: self.rate.get(pid, 0)) if busy else min(members[pgid]))
+            info = proc_info(head, boot_time)
+            if info:
+                groups.append({"pgid": pgid, "recent": self.cores(pgid, 30), "minute": minute,
+                               "busy": busy, "head": info})
+        pools: dict[tuple, list] = {}
+        for g in groups:
+            h = g["head"]
+            launcher = _launch_key(h.get("ppid"), proc_stat, _read_cmdline) if h.get("cmdline") else None
+            key = ((launcher, h.get("user"), h.get("cwd"), _pool_sig(h["cmdline"]))
+                   if launcher is not None else ("solo", g["pgid"]))
+            pools.setdefault(key, []).append(g)
+        clusters = []
+        for gs in pools.values():
+            gs.sort(key=lambda g: g["head"].get("start_ticks") or 0)
+            cur = [gs[0]]
+            for g in gs[1:]:
+                if ((g["head"].get("start_ticks") or 0) - (cur[-1]["head"].get("start_ticks") or 0)
+                        <= POOL_START_SEC * _CLK_TCK):
+                    cur.append(g)
+                else:
+                    clusters.append(cur)
+                    cur = [g]
+            clusters.append(cur)
+        jobs, seen = [], set()
+        for cl in clusters:
+            lead = cl[0]
+            cid = lead["pgid"]
+            recent, minute = sum(g["recent"] for g in cl), sum(g["minute"] for g in cl)
+            if minute < CPU_JOB_KEEP_CORES:
+                continue
+            seen.add(cid)
+            since = self.busy_since.setdefault(cid, now)
+            if cid not in self.shown:
+                if recent < CPU_JOB_MIN_CORES or now - since < CPU_JOB_MIN_SEC:
+                    continue
+                self.shown.add(cid)
+            leader = lead["head"]
+            busy = sorted({pid for g in cl for pid in g["busy"]}, key=lambda pid: -self.rate.get(pid, 0))
+            procs, have = [leader], {leader["pid"]}
+            heads = {g["head"]["pid"]: g["head"] for g in cl}
+            for pid in busy[:4]:
+                if pid not in have:
+                    info = heads.get(pid) or proc_info(pid, boot_time)
+                    if info:
+                        procs.append(info)
+                        have.add(pid)
+            for info in procs:
+                info["cpu_pct"] = round(self.rate.get(info["pid"], 0) * 100)
+            jobs.append({
+                "id": f"cpu-{leader['pid']}-{leader.get('start_ticks')}",
+                "gpus": [], "pids": busy or [leader["pid"]], "vram_mb": 0.0,
+                "cpu": True, "cpu_cores": round(recent, 1),
+                "_leader": leader, "_procs": procs,
+            })
+        for cid in list(self.busy_since):
+            if cid not in seen:
+                self.busy_since.pop(cid, None)
+                self.shown.discard(cid)
+        jobs.sort(key=lambda j: -j["cpu_cores"])
+        self._made, self._made_at = jobs[:CPU_JOB_MAX], self.scanned_at
+        return [dict(j) for j in self._made]
 
 
 # --------------------------------------------------------------------------
@@ -2077,7 +2317,7 @@ AI_OPTIONAL_FLAGS = (
 AI_KINDS = ("training", "evaluation", "inference", "other")
 AI_MODEL = "claude-sonnet-5-5"
 # 답 형식이 바뀌면 올린다. 이 값이 다른 캐시는 버리고 다시 묻는다.
-AI_SCHEMA = 3
+AI_SCHEMA = 4
 AI_EFFORT = "low"
 # 기본은 구독(claude.ai 로그인)으로 부른다. 이 변수들이 환경에 있으면 Claude Code 가
 # API 과금 쪽으로 붙으므로 자식 프로세스에서 지운다. MONITOR_AI_AUTH=api_key 면 남긴다.
@@ -2106,11 +2346,11 @@ def find_claude(hint=None):
                 return path
     return None
 
-AI_PROMPT = """You identify jobs for a GPU monitor. The process below is using a GPU. Find out exactly
+AI_PROMPT = """You identify jobs for a GPU monitor. {subject} Find out exactly
 what this job is, and which log its progress can be read from.
 
-Machine: {label} / GPU: {gpu}
-Process holding the GPU (main process):
+Machine: {label} / {resource}
+{holder}:
 {facts}
 
 Steps:
@@ -2141,7 +2381,7 @@ in {language}.
 
 Output exactly one JSON object as the final answer (no explanation, no code fences):
 {{"kind": "training|evaluation|inference|other",
-  "title": "short name for the screen, at most {title_max} (e.g. {title_example})",
+  "title": "short name for the screen, at most {title_max} (e.g. {title_example}): what the job does. Leave version numbers, ticket IDs, dates and paths out of it — they belong in the summary",
   "summary": "one or two sentences on what experiment this is and what it tries to find out. Leave out the current step and progress (code computes them)",
   "run_dir": "absolute path of the run directory, or null",
   "log_path": "absolute path of the JSONL log to read progress from, or null",
@@ -2154,14 +2394,16 @@ Output exactly one JSON object as the final answer (no explanation, no code fenc
   "total_steps": integer read from the config only when the log lacks the total step count, otherwise null,
   "progress": only for jobs without a step log, how to count progress, otherwise null.
     {{"kind": "lines", "path": "absolute path of a file that grows by one line per unit", "total": target count of the current stage}}
+    or {{"kind": "matches", "path": "absolute path of a log that writes one line per finished unit among other lines", "pattern": "Python regex that only those lines match (e.g. rc=\\d+)", "total": target count of the current stage}}
+    or {{"kind": "files", "path": "absolute path of the folder where one output file appears per finished unit", "pattern": "glob that matches only those files (e.g. CAM01_*.json)", "total": target count of the current stage}}
     or {{"kind": "regex", "path": "absolute path of the log file", "pattern": "Python regex with one group capturing the progress count (e.g. records=(\\d+))", "total": target count of the current stage}}}}
 """
 # 답의 언어. 캐시에 언어를 같이 남겨, 언어를 바꾸면 다시 묻는다.
 AI_LANG = {
-    "en": dict(language="English", title_max="32 characters", title_example="ViT-B/16 pretraining",
+    "en": dict(language="English", title_max="24 characters", title_example="ViT-B/16 pretraining",
                next_max="20 characters", next_example="finetune, eval"),
     "ko": dict(language="Korean; write sentences in the polite form ending in ~합니다",
-               title_max="24 Korean characters", title_example="ViT-B/16 사전학습",
+               title_max="12 Korean characters", title_example="ViT-B/16 사전학습",
                next_max="16 Korean characters", next_example="파인튜닝, eval·채점"),
 }
 
@@ -2215,6 +2457,9 @@ def gpu_leader(gpu):
 
 PROGRESS_WINDOW_SEC = 600.0   # 속도는 최근 이만큼의 증가로 잰다
 PROGRESS_MIN_SPAN_SEC = 45.0  # 이만큼은 지켜봐야 속도를 낸다
+# 개수로 세는 진행은 하나 끝내는 데 몇 분씩 걸리기도 한다. 늘지 않아도 지금까지 본 증가 간격의
+# 2.5배(최소 RUNNING_STALE_SEC)까지는 정상이다. 아직 한 번도 늘지 않았으면 이만큼 기다린다.
+COUNTER_STALE_SEC = 600.0
 
 
 class ProgressCounter:
@@ -2225,8 +2470,10 @@ class ProgressCounter:
     """
     def __init__(self):
         self.lines: dict[str, tuple[int, int]] = {}
+        self.matched: dict[tuple, tuple[int, int]] = {}
         self.samples: dict[str, collections.deque] = {}
         self.changed_at: dict[str, float] = {}
+        self.gaps: dict[str, collections.deque] = {}   # 개수가 늘어난 간격(초)
 
     def _count_lines(self, path):
         size = os.path.getsize(path)
@@ -2244,27 +2491,87 @@ class ProgressCounter:
         self.lines[path] = (offset, count)
         return count
 
+    def _count_matches(self, path, pattern):
+        """패턴에 맞는 줄 수. 끝난 일마다 한 줄씩 남기는 로그용('... rc=0 253초').
+        다 쓴 줄까지만 세고, 다음에는 거기서부터 읽는다."""
+        rx = re.compile(pattern)
+        key = (path, pattern)
+        size = os.path.getsize(path)
+        offset, count = self.matched.get(key, (0, 0))
+        if size < offset:  # 같은 이름으로 새로 썼다
+            offset, count = 0, 0
+        consumed, rest = 0, b""
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            while True:
+                chunk = fh.read(1 << 22)
+                if not chunk:
+                    break
+                buf = rest + chunk
+                end = buf.rfind(b"\n") + 1
+                count += sum(1 for line in buf[:end].decode("utf-8", "replace").splitlines()
+                             if rx.search(line))
+                consumed += end
+                rest = buf[end:]
+        self.matched[key] = (offset + consumed, count)
+        return count
+
     @staticmethod
     def _last_match(path, pattern):
+        """숫자를 잡은 마지막 일치. 그룹이 비는 갈래가 섞인 패턴이어도 숫자를 잡은 일치만 본다."""
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
             fh.seek(max(0, size - 65536))
             text = fh.read().decode("utf-8", "replace")
-        found = re.findall(pattern, text)
-        if not found:
-            return None
-        last = found[-1][0] if isinstance(found[-1], tuple) else found[-1]
-        return float(last)
+        last = None
+        for m in re.finditer(pattern, text):
+            for g in m.groups():
+                if g:
+                    try:
+                        last = float(g)
+                    except ValueError:
+                        pass
+                    break
+        return last
 
-    def measure(self, recipe, now):
-        """(완료 개수, 초당 개수 또는 None, 마지막으로 늘어난 뒤 지난 초, 개수가 줄었나)"""
+    @staticmethod
+    def _file_times(path, pattern, since):
+        """폴더에서 패턴에 맞는 파일의 수정 시각(오름차순). 작업이 시작된 뒤에 생긴 것만 —
+        같은 폴더에 지난 실행의 결과가 남아 있어도 이번 실행 몫만 센다."""
+        times = []
+        for name in glob.glob(os.path.join(path, pattern)):
+            try:
+                mtime = os.path.getmtime(name)
+            except OSError:
+                continue
+            if since is None or mtime >= since - 5:
+                times.append(mtime)
+        return sorted(times)
+
+    def measure(self, recipe, now, since=None):
+        """(완료 개수, 초당 개수 또는 None, 마지막으로 늘어난 뒤 지난 초, 개수가 줄었나, 멈춤으로 볼 초).
+        since: 작업이 시작된 시각(파일 개수로 셀 때 이번 실행 몫을 가른다)."""
         path, kind = recipe.get("path"), recipe.get("kind")
+        pattern = recipe.get("pattern")
+        pattern = pattern if isinstance(pattern, str) and len(pattern) <= 200 else None
+        if kind == "files":
+            # 결과 파일 개수. 파일 시각이 남아 있으니 에이전트가 방금 켜졌어도 속도를 바로 낸다.
+            if not (isinstance(path, str) and os.path.isdir(path) and pattern):
+                return None
+            times = self._file_times(path, pattern, since)
+            start = since if since else (times[0] if times else now)
+            gaps = [b - a for a, b in zip([start] + times[:-1], times)]
+            rate = len(times) / (now - start) if times and now - start >= 60 else None
+            stale_after = max(RUNNING_STALE_SEC, 2.5 * max(gaps)) if gaps else COUNTER_STALE_SEC
+            return len(times), rate, now - (times[-1] if times else start), False, stale_after
         if not isinstance(path, str) or not os.path.isfile(path):
             return None
         if kind == "lines":
             done = self._count_lines(path)
-        elif kind == "regex" and isinstance(recipe.get("pattern"), str) and len(recipe["pattern"]) <= 200:
-            done = self._last_match(path, recipe["pattern"])
+        elif kind == "matches" and pattern:
+            done = self._count_matches(path, pattern)
+        elif kind == "regex" and pattern:
+            done = self._last_match(path, pattern)
         else:
             return None
         if done is None:
@@ -2274,6 +2581,9 @@ class ProgressCounter:
         reset = bool(q) and done < q[-1][1]
         if reset:  # 줄었다 = 다음 블록·새 실행. 처음부터 잰다
             q.clear()
+            self.gaps.pop(key, None)
+        if q and done > q[-1][1] and key in self.changed_at:
+            self.gaps.setdefault(key, collections.deque(maxlen=20)).append(now - self.changed_at[key])
         if not q or done != q[-1][1]:
             self.changed_at[key] = now
         q.append((now, done))
@@ -2281,7 +2591,9 @@ class ProgressCounter:
             q.popleft()
         t0, d0 = q[0]
         rate = (done - d0) / (now - t0) if now - t0 >= PROGRESS_MIN_SPAN_SEC and done > d0 else None
-        return done, rate, now - self.changed_at.get(key, now), reset
+        gaps = self.gaps.get(key)
+        stale_after = (max(RUNNING_STALE_SEC, 2.5 * max(gaps)) if gaps else COUNTER_STALE_SEC)
+        return done, rate, now - self.changed_at.get(key, now), reset, stale_after
 
 
 class AiIdentifier:
@@ -2444,7 +2756,7 @@ class AiIdentifier:
             start = int(leader.get("started_at") or 0)
         return f"{gpu.get('uuid') or gpu.get('index')}-{leader['pid']}-{start}"
 
-    def _facts(self, leader, job_gpus=(), nprocs=1):
+    def _facts(self, leader, job_gpus=(), nprocs=1, cpu=None):
         lines = [f"pid {leader['pid']} (user {leader.get('user')}, "
                  f"running for {int(leader.get('elapsed_sec') or 0)}s)",
                  f"command line: {leader.get('cmdline')}",
@@ -2455,19 +2767,32 @@ class AiIdentifier:
         chain = _parent_chain(leader["pid"])
         if chain:
             lines.append("parent processes:\n  " + "\n  ".join(chain))
-        if len(job_gpus) > 1 or nprocs > 1:
+        if cpu:
+            busy = [p for p in cpu["procs"] if p["pid"] != leader["pid"]]
+            lines.append(f"{nprocs} processes in this job are busy, about {cpu['cores']:.1f} CPU cores in total")
+            if busy:
+                lines.append("busiest processes in the job:\n  " + "\n  ".join(
+                    f"pid {p['pid']} ({p.get('cpu_pct')}% CPU): {(p.get('cmdline') or '')[:400]}" for p in busy))
+        elif len(job_gpus) > 1 or nprocs > 1:
             lines.append(f"this job uses GPUs {', '.join(str(i) for i in job_gpus)} "
                          f"with {nprocs} processes (e.g. distributed training ranks)")
         return "\n".join(lines)
 
-    def _ask(self, key, gpu_name, leader, job_gpus=(), nprocs=1):
+    def _ask(self, key, gpu_name, leader, job_gpus=(), nprocs=1, cpu=None):
         started = time.time()
         result = None
         error = None
         try:
             # 프롬프트도 try 안에서 만든다 — 여기서 죽으면 running 이 풀리지 않아 식별이 영영 멈춘다.
-            prompt = AI_PROMPT.format(label=self.label, gpu=gpu_name,
-                                      facts=self._facts(leader, job_gpus, nprocs),
+            if cpu:
+                head = dict(subject="The job below does not use a GPU but keeps the CPU busy.",
+                            resource=f"CPU: about {cpu['cores']:.1f} cores busy",
+                            holder="Process that started the job (its process group leader)")
+            else:
+                head = dict(subject="The process below is using a GPU.", resource=f"GPU: {gpu_name}",
+                            holder="Process holding the GPU (main process)")
+            prompt = AI_PROMPT.format(label=self.label, **head,
+                                      facts=self._facts(leader, job_gpus, nprocs, cpu),
                                       **AI_LANG.get(LANG, AI_LANG["en"]))
             proc = subprocess.run(
                 [self.command, "-p", prompt, "--output-format", "json",
@@ -2572,7 +2897,7 @@ class AiIdentifier:
         for job in jobs:
             leader = job["_leader"]
             primary = by_index.get(job["gpus"][0]) if job["gpus"] else None
-            key = self.fingerprint(primary or {"index": "x"}, leader)
+            key = self.fingerprint(primary or {"index": "cpu" if job.get("cpu") else "x"}, leader)
             self.job_keys[job["id"]] = key
             alive.add(key)
             self.first_seen.setdefault(key, now)
@@ -2585,14 +2910,15 @@ class AiIdentifier:
                 "kind", "title", "summary", "stage", "next", "next_short", "next_source",
                 "rest_sec", "rest_stages", "rest_basis", "run_dir", "log_path",
                 "identified_at")}}
-            run = self._run_for(result, runs, now)
+            run = self._run_for(result, runs, now, leader.get("started_at"))
             if id(result) in self._stale:
                 self._stale.discard(id(result))
                 self.forget(key)
             if run is not None:
                 job["run"] = run_brief(run)
-                busy = any(((by_index.get(i) or {}).get("util_pct") or 0) > FREE_UTIL_PCT
-                           for i in job["gpus"])
+                busy = ((job.get("cpu_cores") or 0) >= CPU_JOB_MIN_CORES if job.get("cpu") else
+                        any(((by_index.get(i) or {}).get("util_pct") or 0) > FREE_UTIL_PCT
+                            for i in job["gpus"]))
                 if (run.get("status") == "idle" and busy
                         and now - (result.get("identified_at") or 0) > AI_RECHECK_SEC):
                     # 답한 로그는 멈췄는데 GPU 는 일한다 = 같은 프로세스가 다음 단계로
@@ -2613,11 +2939,13 @@ class AiIdentifier:
             if now - self.failed_at.get(key, 0) < AI_RETRY_SEC:
                 return
             self.running = key
+        cpu = ({"cores": job.get("cpu_cores") or 0.0, "procs": list(job.get("_procs") or [])}
+               if job.get("cpu") else None)
         threading.Thread(target=self._ask,
-                         args=(key, gpu.get("name"), leader, list(job["gpus"]), len(job["pids"])),
+                         args=(key, gpu.get("name"), leader, list(job["gpus"]), len(job["pids"]), cpu),
                          daemon=True).start()
 
-    def _run_for(self, result, runs, now):
+    def _run_for(self, result, runs, now, since=None):
         run = None
         log_path = result.get("log_path")
         if isinstance(log_path, str) and os.path.isfile(log_path):
@@ -2632,7 +2960,7 @@ class AiIdentifier:
                     runs.insert(0, run)
         recipe = result.get("progress")
         if (run is None or run.get("step") is None) and isinstance(recipe, dict):
-            return self._run_from_counter(result, recipe, run, runs, now)
+            return self._run_from_counter(result, recipe, run, runs, now, since)
         if run is None:
             return None
         total = result.get("total_steps")
@@ -2644,21 +2972,25 @@ class AiIdentifier:
                     run["eta_sec"] = max(0.0, total - run["step"]) / run["steps_per_sec"]
         return run
 
-    def _run_from_counter(self, result, recipe, run, runs, now):
-        measured = safe(lambda: self.counter.measure(recipe, now))
+    def _run_from_counter(self, result, recipe, run, runs, now, since=None):
+        measured = safe(lambda: self.counter.measure(recipe, now, since))
         if not isinstance(measured, tuple):
             return run
-        done, rate, quiet, reset = measured
+        done, rate, quiet, reset, stale_after = measured
         if reset and now - (result.get("identified_at") or now) > 60:
             # 같은 프로세스가 다음 블록으로 넘어갔다. 남은 단계 추정이 묵었으니 다시 묻는다.
             self._stale.add(id(result))
         total = recipe.get("total")
         total = total if isinstance(total, (int, float)) and total > 0 else None
-        status = "running" if quiet <= RUNNING_STALE_SEC else "idle"
+        status = "running" if quiet <= stale_after else "idle"
         if run is None:  # runs 에 넣어야 대시보드가 같은 dir 로 찾는다
             path = recipe["path"]
-            run = {"name": os.path.basename(os.path.dirname(path)) or os.path.basename(path),
-                   "dir": os.path.dirname(path), "log": os.path.basename(path)}
+            if recipe.get("kind") == "files":
+                run = {"name": os.path.basename(path.rstrip("/")) or path, "dir": path,
+                       "log": recipe.get("pattern")}
+            else:
+                run = {"name": os.path.basename(os.path.dirname(path)) or os.path.basename(path),
+                       "dir": os.path.dirname(path), "log": os.path.basename(path)}
             runs.insert(0, run)
         run.update({
             "status": status, "log_age_sec": quiet, "step": done, "max_steps": total,
@@ -2690,6 +3022,11 @@ def build_snapshot(args, cpu_sampler, cpu_temp, wsl, minor_to_bus):
     opaque = wsl and not procs
     unattributed = safe(lambda: attach_processes(gpus, procs, opaque), []) or []
     jobs = safe(lambda: group_jobs(gpus), []) or []
+    # GPU 를 안 쓰고 CPU 만 붙잡은 작업. GPU 작업이 든 프로세스 그룹은 거기서 이미 보인다.
+    gpu_groups = {p.get("pgid") for p in procs if isinstance(p, dict)
+                  and p.get("kind") == "compute" and p.get("pgid") is not None}
+    boot = safe(lambda: now - collect_uptime())
+    jobs += safe(lambda: args.cpu_jobs.collect(now, gpu_groups, boot), []) or []
     free_gpus = [g["index"] for g in gpus
                  if isinstance(g, dict) and g.get("is_free")]
     runs = (safe(lambda: collect_runs(args.watch, args.run_log, now), [])
@@ -2915,6 +3252,7 @@ def main():
     args.ai = (None if args.ai_mode == "off" else
                AiIdentifier(args.ai_cmd, args.label, args.ai_auth, required=args.ai_mode == "on"))
 
+    args.cpu_jobs = CpuJobs()
     wsl = is_wsl()
     minor_to_bus = safe(read_minor_to_bus, {}) or {}
     cpu_sampler = CpuSampler()

@@ -132,9 +132,11 @@ main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
 .mtab tr.mrow:not(.last) > td:not([rowspan]) { border-bottom: 0; padding-bottom: 1px; }
 .mtab tr.mrow.cont > td { padding-top: 1px; }
 .meter.stall > i { background: var(--serious); }
-/* 다음 작업: 제목보다 한 톤 흐리게. 문서상 계획일 뿐이면 더 흐리게, 기울여서. */
-.mtab td.work .nx { color: var(--ink-3); font-weight: 400; }
-.mtab td.work .nx.plan { font-style: italic; opacity: .8; }
+.meter.cpu > i { background: var(--s7); }
+.mtab td.work .side { margin-left: 16px; color: var(--ink-2); font-weight: 400; }
+.mtab td.work .side.solo { margin-left: 0; color: inherit; font-weight: inherit; }
+.mtab td.work .ctag { font-size: 10.5px; font-weight: 600; letter-spacing: .03em; color: var(--s7);
+  border: 1px solid var(--ring); border-radius: 4px; padding: 0 4px; margin-right: 6px; vertical-align: 1px; }
 /* 상태 점 */
 .sdot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 9px;
   vertical-align: -1px; position: relative; background: var(--axis); box-shadow: var(--dot-ring); }
@@ -163,15 +165,18 @@ main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
 .aibox .redo-note { margin-left: 10px; }
 .aibox p { margin: 3px 0 0; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
 .aibox p.sub { white-space: normal; max-width: none; }
+/* 중간 폭: 종료 칸의 '(남은 시간)' 을 빼 작업 이름에 자리를 준다. */
+@media (max-width: 1100px) { .mtab td.p-eta .eta-left { display: none; } }
 /* 폰 폭: 점유 프로세스 칸과 바를 접는다 — 이름·%·종료시각만으로 답이 된다. */
 @media (max-width: 640px) {
   .mtab td.p-bar { display: none; }
   .mtab td.work { width: 50%; }
   .mtab th { white-space: nowrap; }
-  .mtab td.p-eta { white-space: normal; min-width: 9ch; }
-  .mtab td.p-eta .sub { white-space: nowrap; }
-  .mtab td.p-eta .eta-left { display: none; }
-  .mtab td.p-eta .eta-all { display: block; }
+  /* CPU 요약이 붙은 줄은 '사용 가능' 글자를 뺀다 — GPU 가 빈 것은 초록 점이 말한다. */
+  .mtab td.work .beside { display: none; }
+  .mtab td.work .side { margin-left: 0; }
+  /* 종료 문구는 줄을 바꾸지 않는다. 폰에서는 지금 단계의 종료 시각만 둔다(남은 시간·체인 전체는 넓은 화면에서). */
+  .mtab td.p-eta .eta-left, .mtab td.p-eta .eta-all { display: none; }
 }
 .mtab tr.mrow { cursor: pointer; }
 .mtab tr.mrow:hover td, .mtab tbody.mgrp:has(tr.mrow:hover) tr.mrow td { background: var(--hover); }
@@ -241,6 +246,7 @@ const I18N = {
     etaNone: "ETA —", ends: (c) => `ends ${c}`, allBy: (c) => ` · all done ${c}`,
     lossAria: (a, b) => `loss curve from ${a} to ${b}`,
     offline: (a) => `offline · ${a}`, available: "available", inUse: "in use", aiChecking: " · AI identifying…",
+    cpuCores: (n) => `CPU · about ${n} cores busy`, cpuUse: (n) => `CPU ${n} cores`,
     restStages: "Remaining: ", next: "Next: ", basis: "Estimate: ",
     st: { off: "offline", train: "training", stall: "training stalled", work: "working",
           wstall: "work stalled", pause: "paused", busy: "in use", unknown: "in use (unknown)", free: "free" },
@@ -269,6 +275,7 @@ const I18N = {
     etaNone: "종료 —", ends: (c) => `${c} 종료`, allBy: (c) => ` · 전체 ${c}`,
     lossAria: (a, b) => `loss 곡선 ${a}에서 ${b}까지`,
     offline: (a) => `오프라인 · ${a}`, available: "사용 가능", inUse: "점유", aiChecking: " · AI 확인 중…",
+    cpuCores: (n) => `CPU 약 ${n}코어 사용`, cpuUse: (n) => `CPU ${n}코어`,
     restStages: "남은 단계: ", next: "다음: ", basis: "추정 근거: ",
     st: { off: "오프라인", train: "학습 중", stall: "학습 멈춤", work: "작업 중",
           wstall: "작업 멈춤", pause: "일시정지", busy: "점유 중", unknown: "점유 중(불명)", free: "비어있음" },
@@ -500,7 +507,7 @@ function panelHtml(metric, series, i) {
 function jobsOf(m) {
   const full = (brief) => brief ? ((m.runs || []).find((r) => r.dir === brief.dir) || brief) : null;
   if (Array.isArray(m.jobs)) return m.jobs.map((j) => ({ id: j.id, gpus: j.gpus || [], ai: j.ai,
-    brief: j.run, run: full(j.run), label: j.label, paused: !!j.paused }));
+    brief: j.run, run: full(j.run), label: j.label, paused: !!j.paused, cpu: !!j.cpu, cores: j.cpu_cores }));
   return (m.gpus || []).filter((g) => g.compute_process_count > 0 || g.run).map((g) => ({
     id: null, gpus: [g.index], ai: g.ai, brief: g.run, run: full(g.run),
     label: g.state_reason, paused: !!g.paused }));
@@ -650,31 +657,44 @@ function machineTable(machines) {
       const pendingAi = j.ai && j.ai.status === "pending";
       const what = r ? (a ? a.title : r.name)
         : a ? a.title : (j.label || t("inUse")) + (pendingAi ? t("aiChecking") : "");
-      // 다음 작업: 체인·큐로 실제 예약된 것과 문서상 계획만 있는 것을 구분한다.
-      // count: 지금 단계 뒤에 남은 단계 수(다음 작업 포함). 2 이상이면 '외 N개'로 붙인다.
-      const next = a && a.next_short ? { name: a.next_short, plan: a.next_source !== "chain",
-        count: Array.isArray(a.rest_stages) ? a.rest_stages.length : 0 } : null;
+      // 다음 작업은 줄에 붙이지 않는다(이름이 길어진다). 펼친 상세의 '다음:' 과 풍선 도움말에 있다.
       // 체인 전체 종료는 실제로 예약된 남은 단계가 있을 때만 — 계획은 시각을 약속하지 않는다.
       const rest = a && a.next_source === "chain" && num(a.rest_sec) ? a.rest_sec : null;
       const stages = a && Array.isArray(a.rest_stages) && a.rest_stages.length
         ? t("restStages") + a.rest_stages.map((x) => `${x.name}${num(x.sec) ? ` ${dur(x.sec)}` : ""}`).join(" → ") : null;
-      const tip = [a && a.summary, a && a.next && t("next") + a.next, r && r.dir, j.label].filter(Boolean).join("\n");
+      const tip = [j.cpu && num(j.cores) && t("cpuCores", j.cores), a && a.summary, a && a.next && t("next") + a.next,
+        r && r.dir, j.label].filter(Boolean).join("\n");
       const etaTip = [stages, a && a.rest_basis && t("basis") + a.rest_basis].filter(Boolean).join("\n");
-      return { gpus: j.gpus, r, brief: j.brief || r, state, what, tip, next, rest, etaTip };
+      return { gpus: j.gpus, cpu: j.cpu, r, brief: j.brief || r, state, what, tip, rest, etaTip };
     };
     // 한 줄 = 작업 하나. 작업이 없는 GPU 는 빈 것끼리 묶고(GPU5–7 사용 가능), 프로세스를
-    // 못 찾은 점유는 GPU 마다 따로 쓴다.
+    // 못 찾은 점유는 GPU 마다 따로 쓴다. GPU 를 안 쓰는 CPU 작업은 그 아래에 'CPU' 를 달고 둔다.
     let lines;
     if (!m.online) lines = [{ gpus: [], state: "off", what: t("offline", ago(m.age_sec)), tip: "" }];
     else {
-      lines = jobs.map(jobLine);
+      lines = jobs.filter((j) => !j.cpu).map(jobLine);
       const covered = new Set(jobs.flatMap((j) => j.gpus));
       const rest = gpus.filter((x) => !covered.has(x.index));
       const free = rest.filter((x) => x.state === "free").map((x) => x.index);
       for (const x of rest.filter((x) => x.state !== "free"))
         lines.push({ gpus: [x.index], state: x.state === "busy" ? "busy" : "unknown",
                      what: x.state_reason || t("inUse"), tip: x.state_reason || "" });
-      if (free.length) lines.push({ gpus: free, state: "free", what: t("available"), tip: "" });
+      // CPU 작업은 여러 개여도 한 줄로 요약한다: 'CPU 이름 외 N개'. 진행률이 있는 것을 앞에 세워
+      // 그 진행률·종료 시각을 보라색 막대로 단다(GPU 의 파란 막대와 구분). 진행률을 모르면 쓰는
+      // 코어 수를 적는다. GPU 가 비어 있으면 '사용 가능' 줄 오른쪽에 붙여 머신이 한 줄로 끝난다.
+      const cpuJobs = jobs.filter((j) => j.cpu)
+        .sort((a, b) => (!!b.run - !!a.run) || ((b.cores || 0) - (a.cores || 0)));
+      const cpuText = (j) => {
+        const l = jobLine(j), r = j.run, eta = r && r.status === "running" && num(j.brief && j.brief.eta_sec)
+          ? Math.max(0, j.brief.eta_sec - (num(m.age_sec) ? m.age_sec : 0)) : null;
+        return [l.what, r && num(r.progress_pct) && pct(r.progress_pct, 0), eta !== null && t("ends", clockAt(eta)),
+                num(j.cores) && t("cpuCores", j.cores)].filter(Boolean).join(" · ");
+      };
+      const side = cpuJobs.length ? { head: jobLine(cpuJobs[0]), count: cpuJobs.length,
+        cores: Math.round(cpuJobs.reduce((n, j) => n + (num(j.cores) ? j.cores : 0), 0) * 10) / 10,
+        tip: cpuJobs.map(cpuText).join("\n") } : null;
+      if (free.length) lines.push({ gpus: free, state: "free", what: t("available"), tip: "", side });
+      else if (side) lines.push({ gpus: [], state: side.head.state, what: "", tip: "", side });
       if (!lines.length) lines.push({ gpus: [], state: "free", what: t("available"), tip: "" });
     }
     const STATE_TEXT = t("st");
@@ -683,18 +703,30 @@ function machineTable(machines) {
                    title="${STATE_TEXT[lines[0].state]}"></span>`;
     // 작업 하나 = 표의 행 하나. 칸마다 줄을 쌓으면 막대(짧음)와 글(김)의 높이가 달라
     // 작업이 여럿일 때 이름·%·막대·종료 시각이 서로 다른 줄로 어긋난다.
-    const cells = (l) => `
-      <td class="work"><div title="${esc(l.tip)}">${multi && l.gpus.length ? `${esc(gpuLabel(l.gpus))} ` : ""}${esc(l.what)}${
-        l.next ? `<span class="nx${l.next.plan ? " plan" : ""}"> → ${esc(l.next.name)}${
-          l.next.count > 1 ? esc(t("more", l.next.count - 1)) : ""}${l.next.plan ? esc(t("planned")) : ""}</span>` : ""}</div></td>
-      <td class="p-pc">${l.r ? esc(pct(l.r.progress_pct, 0)) : ""}</td>
-      <td class="p-bar">${!l.r ? "" : `<div class="meter ${/stall/.test(l.state) ? "stall" : l.state === "pause" ? "idle" : ""}"><i style="width:${
-        num(l.r.progress_pct) ? Math.min(100, l.r.progress_pct).toFixed(1) : 0}%"></i></div>`}</td>
-      <td class="p-eta">${!l.r ? ""
-        : l.state === "pause" ? `<span class="sub">${esc(t("pausedFor", dur(l.r.log_age_sec)))}</span>`
-        : !/stall/.test(l.state) ? `<span class="sub" title="${esc(l.etaTip)}">${etaHtml(l.brief.eta_sec, m.age_sec, l.rest)}</span>`
+    const sideHtml = (sd, solo) => `<span class="side${solo ? " solo" : ""}" title="${esc(sd.tip)}"><span class="ctag">CPU</span>${
+      esc(sd.head.what)}${sd.count > 1 ? esc(t("more", sd.count - 1)) : ""}</span>`;
+    const name = (l) => `<div title="${esc(l.tip)}">${multi && l.gpus.length ? `${esc(gpuLabel(l.gpus))} ` : ""}${
+      l.side && l.what ? `<span class="beside">${esc(l.what)}</span>` : esc(l.what)}${l.side ? sideHtml(l.side, !l.what) : ""}</div>`;
+    // 진행률은 그 줄의 작업 것, CPU 요약이 붙은 줄이면 요약 맨 앞 작업 것이다.
+    // 진행률이 없는 줄은 이름이 빈 %·막대·종료 칸까지 쓴다(폰에서 이름이 덜 잘린다).
+    const cells = (l) => {
+      const p = l.r ? l : l.side && l.side.head.r ? l.side.head : null;
+      if (!p && l.side && l.side.cores) return `
+      <td class="work" colspan="3">${name(l)}</td>
+      <td class="p-eta"><span class="sub">${esc(t("cpuUse", l.side.cores))}</span></td>`;
+      if (!p) return `
+      <td class="work" colspan="4">${name(l)}</td>`;
+      const tone = /stall/.test(p.state) ? "stall" : p.state === "pause" ? "idle" : p === l ? "" : "cpu";
+      return `
+      <td class="work">${name(l)}</td>
+      <td class="p-pc">${esc(pct(p.r.progress_pct, 0))}</td>
+      <td class="p-bar"><div class="meter ${tone}"><i style="width:${
+        num(p.r.progress_pct) ? Math.min(100, p.r.progress_pct).toFixed(1) : 0}%"></i></div></td>
+      <td class="p-eta">${p.state === "pause" ? `<span class="sub">${esc(t("pausedFor", dur(p.r.log_age_sec)))}</span>`
+        : !/stall/.test(p.state) ? `<span class="sub" title="${esc(p.etaTip)}">${etaHtml(p.brief.eta_sec, m.age_sec, p.rest)}</span>`
         // 프로세스는 GPU 를 물고 있는데 로그가 안 쌓인다 = 멈춤. 남은 시간은 계산할 수 없다.
-        : `<span class="sub stall">${esc(t("stalledFor", dur(l.r.log_age_sec)))}</span>`}</td>`;
+        : `<span class="sub stall">${esc(t("stalledFor", dur(p.r.log_age_sec)))}</span>`}</td>`;
+    };
     // 상세는 고른 GPU 하나를 보여 준다. GPU 가 여러 장이면 맨 위에서 고른다.
     const tabs = multi ? `<div class="gtabs" role="tablist">${gpus.map((x) => {
       const busy = jobs.some((j) => j.gpus.includes(x.index));
@@ -716,13 +748,14 @@ function machineTable(machines) {
     ];
     // 고른 GPU 에서 도는 작업들. 식별했으면 설명을, 아니면 이름만 쓰고, '다시 식별' 버튼을 단다.
     const aiOn = m.online && m.ai_status && m.ai_status.state !== "off";
-    const here = jobs.filter((j) => j.gpus.includes(g.index));
+    const here = [...jobs.filter((j) => !j.cpu && j.gpus.includes(g.index)), ...jobs.filter((j) => j.cpu)];
     const boxes = here.map((j) => {
       const a = aiOf(j), rs = j.id && redoState.get(j.id);
       const redo = aiOn && j.id ? (rs && Date.now() - rs.at < 60000
         ? `<span class="sub redo-note">${esc(rs.label)}</span>`
         : `<button class="ghost redo" data-mid="${esc(m.machine_id)}" data-job="${esc(j.id)}">${esc(t("redo"))}</button>`) : "";
-      const head = `${multi ? `${esc(gpuLabel(j.gpus))} · ` : ""}${esc(a ? a.title : (j.label || t("inUse")))}`;
+      const head = `${j.cpu ? "CPU · " : multi ? `${esc(gpuLabel(j.gpus))} · ` : ""}${esc(a ? a.title : (j.label || t("inUse")))}${
+        j.run && num(j.run.progress_pct) ? ` · ${esc(pct(j.run.progress_pct, 0))}` : ""}`;
       if (!a) return `<div class="aibox"><h4>${head}<span class="sub">${
         j.ai && j.ai.status === "pending" ? esc(t("aiChecking")) : ""}</span>${redo}</h4></div>`;
       return `<div class="aibox">
