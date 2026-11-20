@@ -128,7 +128,9 @@ main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
 .mtab td.p-bar .meter { margin: 2px 0; height: 14px; border-radius: 5px; }
 .mtab td.p-eta { width: 1%; white-space: nowrap; text-align: right; }
 .mtab td.p-eta .sub { max-width: none; }
-.mtab td.work > div + div, .mtab td.p-pc > div + div, .mtab td.p-eta > div + div { margin-top: 3px; }
+/* 한 머신의 작업 행들: 사이 선과 위아래 여백을 줄여 한 덩어리로 보이게 한다. */
+.mtab tr.mrow:not(.last) > td:not([rowspan]) { border-bottom: 0; padding-bottom: 1px; }
+.mtab tr.mrow.cont > td { padding-top: 1px; }
 .meter.stall > i { background: var(--serious); }
 /* 다음 작업: 제목보다 한 톤 흐리게. 문서상 계획일 뿐이면 더 흐리게, 기울여서. */
 .mtab td.work .nx { color: var(--ink-3); font-weight: 400; }
@@ -172,7 +174,7 @@ main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
   .mtab td.p-eta .eta-all { display: block; }
 }
 .mtab tr.mrow { cursor: pointer; }
-.mtab tr.mrow:hover td { background: var(--hover); }
+.mtab tr.mrow:hover td, .mtab tbody.mgrp:has(tr.mrow:hover) tr.mrow td { background: var(--hover); }
 .mtab tr.mrow:focus-visible { outline: 2px solid var(--s1); outline-offset: -2px; }
 .mtab td.caret { width: 1%; padding-right: 0; color: var(--ink-3); }
 .mtab tr.mdet > td { background: var(--inset); padding: 11px 14px 14px; }
@@ -679,19 +681,20 @@ function machineTable(machines) {
     // 상태는 글자 대신 점 하나로 — 학습 중은 맥박, 멈춤은 주황, 비었으면 초록.
     const dot = `<span class="sdot ${lines[0].state}" role="img" aria-label="${STATE_TEXT[lines[0].state]}"
                    title="${STATE_TEXT[lines[0].state]}"></span>`;
-    const col = (f) => lines.map((l) => `<div>${f(l) || "&nbsp;"}</div>`).join("");
-    const prog = `
-      <td class="work">${col((l) => `<span title="${esc(l.tip)}">${multi && l.gpus.length ? `${esc(gpuLabel(l.gpus))} ` : ""}${esc(l.what)}${
+    // 작업 하나 = 표의 행 하나. 칸마다 줄을 쌓으면 막대(짧음)와 글(김)의 높이가 달라
+    // 작업이 여럿일 때 이름·%·막대·종료 시각이 서로 다른 줄로 어긋난다.
+    const cells = (l) => `
+      <td class="work"><div title="${esc(l.tip)}">${multi && l.gpus.length ? `${esc(gpuLabel(l.gpus))} ` : ""}${esc(l.what)}${
         l.next ? `<span class="nx${l.next.plan ? " plan" : ""}"> → ${esc(l.next.name)}${
-          l.next.count > 1 ? esc(t("more", l.next.count - 1)) : ""}${l.next.plan ? esc(t("planned")) : ""}</span>` : ""}</span>`)}</td>
-      <td class="p-pc">${col((l) => l.r ? esc(pct(l.r.progress_pct, 0)) : "")}</td>
-      <td class="p-bar">${col((l) => { if (!l.r) return ""; const p = l.r.progress_pct;
-        return `<div class="meter ${/stall/.test(l.state) ? "stall" : l.state === "pause" ? "idle" : ""}"><i style="width:${num(p) ? Math.min(100, p).toFixed(1) : 0}%"></i></div>`; })}</td>
-      <td class="p-eta">${col((l) => !l.r ? ""
+          l.next.count > 1 ? esc(t("more", l.next.count - 1)) : ""}${l.next.plan ? esc(t("planned")) : ""}</span>` : ""}</div></td>
+      <td class="p-pc">${l.r ? esc(pct(l.r.progress_pct, 0)) : ""}</td>
+      <td class="p-bar">${!l.r ? "" : `<div class="meter ${/stall/.test(l.state) ? "stall" : l.state === "pause" ? "idle" : ""}"><i style="width:${
+        num(l.r.progress_pct) ? Math.min(100, l.r.progress_pct).toFixed(1) : 0}%"></i></div>`}</td>
+      <td class="p-eta">${!l.r ? ""
         : l.state === "pause" ? `<span class="sub">${esc(t("pausedFor", dur(l.r.log_age_sec)))}</span>`
         : !/stall/.test(l.state) ? `<span class="sub" title="${esc(l.etaTip)}">${etaHtml(l.brief.eta_sec, m.age_sec, l.rest)}</span>`
         // 프로세스는 GPU 를 물고 있는데 로그가 안 쌓인다 = 멈춤. 남은 시간은 계산할 수 없다.
-        : `<span class="sub stall">${esc(t("stalledFor", dur(l.r.log_age_sec)))}</span>`)}</td>`;
+        : `<span class="sub stall">${esc(t("stalledFor", dur(l.r.log_age_sec)))}</span>`}</td>`;
     // 상세는 고른 GPU 하나를 보여 준다. GPU 가 여러 장이면 맨 위에서 고른다.
     const tabs = multi ? `<div class="gtabs" role="tablist">${gpus.map((x) => {
       const busy = jobs.some((j) => j.gpus.includes(x.index));
@@ -734,25 +737,27 @@ function machineTable(machines) {
       : `<h4>${esc(run.name)} · loss ${esc(autoNum(run.loss_total))}${
            num(run.step) ? ` · step ${esc(nf(run.step))}/${esc(nf(run.max_steps))}` : ""}</h4>
          <div class="plot" data-loss="${esc(m.machine_id)}"></div>`;
-    return `<tr class="mrow" data-id="${esc(m.machine_id)}" tabindex="0"
-              aria-expanded="${open}"${shown(m) ? "" : ' style="opacity:.45"'}>
-      <td class="caret">${open ? "▾" : "▸"}</td>
-      <td class="who">${dot}<span class="nm"><span class="k" style="background:${colorOf.get(m.machine_id)}"></span>${
-        esc(m.label || m.machine_id)}</span></td>
-      ${prog}
-    </tr>
-    <tr class="mdet" data-id="${esc(m.machine_id)}"${open ? "" : " hidden"}><td colspan="6">
+    // 머신 하나 = tbody 하나. 첫 행만 머신 칸(rowspan)과 키보드 초점을 갖고, 어느 행을 눌러도 펼친다.
+    const n = lines.length, id = esc(m.machine_id), fade = shown(m) ? "" : ' style="opacity:.45"';
+    const trs = lines.map((l, i) => `<tr class="mrow${i ? " cont" : ""}${i === n - 1 ? " last" : ""}" data-id="${id}"${
+        i ? "" : ` tabindex="0" aria-expanded="${open}"`}${fade}>${i ? "" : `
+      <td class="caret" rowspan="${n}">${open ? "▾" : "▸"}</td>
+      <td class="who" rowspan="${n}">${dot}<span class="nm"><span class="k" style="background:${colorOf.get(m.machine_id)}"></span>${
+        esc(m.label || m.machine_id)}</span></td>`}${cells(l)}
+    </tr>`).join("");
+    return `<tbody class="mgrp">${trs}
+    <tr class="mdet" data-id="${id}"${open ? "" : " hidden"}><td colspan="6">
       ${tabs}
       <dl class="kv">${hw.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join("")}</dl>
       ${boxes}
       ${lossPart}
-    </td></tr>`;
+    </td></tr></tbody>`;
   }).join("");
   return `<section class="panel wide">
     <div class="ptitle">${esc(t("machines", machines.length))}</div>
     <table class="mtab"><thead><tr>
       <th></th><th>${esc(t("colMachine"))}</th><th>${esc(t("colWhat"))}</th><th colspan="3" class="r">${esc(t("colProg"))}</th>
-    </tr></thead><tbody>${rows}</tbody></table></section>`;
+    </tr></thead>${rows}</table></section>`;
 }
 
 // =====================================================================

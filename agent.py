@@ -48,7 +48,7 @@ WINDOWS = os.name == "nt"
 # 윈도우에서 창 없이(pythonw) 돌 때 nvidia-smi·powershell·claude 가 콘솔 창을 띄우지 않게 한다.
 NOWIN = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if WINDOWS else {}
 
-AGENT_VERSION = "2.14.0"
+AGENT_VERSION = "2.15.0"
 
 # 화면에 보이는 문구의 언어: en(기본) | ko. 에이전트가 만드는 문구(빈 GPU 사유·AI 상태)와
 # AI 가 쓰는 작업 설명이 이 언어로 나온다. main() 이 --lang / $MONITOR_LANG 으로 정한다.
@@ -1014,7 +1014,27 @@ def _launch_sig(cmdline):
     return cmdline
 
 
-def group_jobs(gpus, stat=proc_stat, dist=dist_key):
+def _pool_sig(cmdline):
+    """일꾼 묶음 비교용 명령. 'w3'·'--shard 2'·'cuda:1' 같은 번호 토큰의 숫자만 지운다.
+    경로·파일 이름·소수('exp1.yaml', 'runs/a2', '--lr 0.1')의 숫자는 둔다 — 거기가
+    다르면 같은 일을 나눠 맡은 일꾼이 아니라 서로 다른 실험이다."""
+    return " ".join(tok if ("/" in tok or "." in tok) else re.sub(r"\d+", "#", tok)
+                    for tok in (cmdline or "").split())
+
+
+# 스크립트를 돌리는 셸('bash run.sh', 'bash -c …')은 런처다. 터미널의 대화형 셸('bash', '-zsh')은 아니다.
+SHELL_COMMS = {"bash", "sh", "dash", "zsh", "fish", "ksh", "tcsh", "csh"}
+# 같은 런처가 이 안에 잇달아 띄운 같은 명령은 일꾼 묶음이다. 빈 GPU 가 날 때마다 하나씩
+# 띄우는 큐 러너의 작업들은 시작 시각이 벌어져 따로 남는다.
+POOL_START_SEC = 60.0
+
+
+def _script_shell(cmdline):
+    args = (cmdline or "").split()[1:]
+    return "-c" in args or any(not a.startswith(("-", "+")) for a in args)
+
+
+def group_jobs(gpus, stat=proc_stat, dist=dist_key, cmdline=None):
     """GPU 컴퓨트 점유자를 작업으로 묶는다. 작업 목록을 GPU 번호 순으로 돌려준다.
 
     한 작업으로 보는 경우:
@@ -1023,7 +1043,14 @@ def group_jobs(gpus, stat=proc_stat, dist=dist_key):
       3. 셸이 아닌 같은 부모에서 같은 명령으로 떴다(torchrun·deepspeed·accelerate 의 rank).
          단, 둘 다 환경을 읽을 수 있는데 분산 학습 표식이 없으면 따로 띄운 작업으로 본다.
       4. 분산 학습 랑데부(MASTER_ADDR·MASTER_PORT·RUN_ID)가 같다.
+      5. 일꾼 묶음: 같은 부모가 같은 디렉터리에서 번호만 다른 명령(_pool_sig)으로 띄웠고
+         (가) 프로세스 그룹이 같거나 — 셸 스크립트·xargs 가 작업 제어 없이 함께 띄웠다,
+         (나) 부모가 런처(스크립트 셸·파이썬 러너 등)이고 POOL_START_SEC 안에 잇달아 떴다
+              — 일꾼마다 setsid 로 그룹을 따로 연 경우.
+         터미널에서 따로 띄운 작업은 셸의 작업 제어가 작업마다 그룹을 새로 주고 부모가
+         대화형 셸이라 걸리지 않는다. 그룹을 모르는 윈도우는 이 규칙을 쓰지 않는다.
     """
+    cmdline = cmdline or _read_cmdline
     procs: dict[int, dict] = {}
     where: dict[int, set] = {}
     vram: dict[int, float] = {}
@@ -1079,6 +1106,31 @@ def group_jobs(gpus, stat=proc_stat, dist=dist_key):
             continue
         for pid in pids[1:]:
             union(pids[0], pid)
+    pools: dict[tuple, list] = {}
+    for pid, p in procs.items():                          # 5. 일꾼 묶음
+        st = stats.get(pid)
+        if WINDOWS or not st or st[0] <= 1 or not p.get("cmdline"):
+            continue
+        pools.setdefault((st[0], p.get("cwd"), _pool_sig(p["cmdline"])), []).append(pid)
+    for (ppid, _, _), pids in pools.items():
+        if len(pids) < 2:
+            continue
+        by_group: dict[int, list] = {}                    # (가) 같은 프로세스 그룹
+        for pid in pids:
+            if procs[pid].get("pgid") is not None:
+                by_group.setdefault(procs[pid]["pgid"], []).append(pid)
+        for same in by_group.values():
+            for pid in same[1:]:
+                union(same[0], pid)
+        parent = stat(ppid)                               # (나) 런처가 잇달아 띄웠다
+        if not parent or (parent[1] in SESSION_COMMS
+                          and not (parent[1] in SHELL_COMMS and _script_shell(cmdline(ppid)))):
+            continue
+        timed = sorted((procs[pid]["start_ticks"], pid) for pid in pids
+                       if procs[pid].get("start_ticks") is not None)
+        for (t0, a), (t1, b) in zip(timed, timed[1:]):
+            if t1 - t0 <= POOL_START_SEC * _CLK_TCK:
+                union(a, b)
     by_key: dict[tuple, int] = {}
     for pid, (_, key) in keys.items():                    # 4. 같은 랑데부
         if key is not None:

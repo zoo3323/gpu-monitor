@@ -4,7 +4,7 @@
 
 ## Jobs and GPUs
 
-- One row is one job. A training run spread over several GPUs (DDP, torchrun, mp.spawn, DataParallel) is one row such as `GPU0–3`, identified once. Two different jobs on one GPU are two rows. Idle GPUs are grouped (`GPU5–7 available`).
+- One row is one job. A training run spread over several GPUs (DDP, torchrun, mp.spawn, DataParallel) is one row such as `GPU0–3`, identified once. So are parallel workers that one script, `xargs` or Python runner starts together with the same command except for numbers (`--worker 3`, `--shard 2`). Two different jobs on one GPU are two rows, and so are jobs you start separately from a terminal. Idle GPUs are grouped (`GPU5–7 available`).
 - Open a machine to pick a GPU. The detail (specs, job description, loss curve) and the charts at the top follow the picked GPU.
 - **Re-identify** next to a job description asks the AI again — when it named the job wrong, or after you logged in to Claude. A job can be re-identified once a minute.
 
