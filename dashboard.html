@@ -121,10 +121,11 @@ main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
 .mtab td { padding: 5px 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
 .mtab td.who { white-space: nowrap; width: 1%; }
 /* max-width:0 이어야 표 칸이 내용보다 좁아지며 말줄임된다. */
-.mtab td.work { width: 30%; max-width: 0; white-space: nowrap; font-weight: 500; }
+.mtab td.work { width: 100%; max-width: 0; white-space: nowrap; font-weight: 500; }
 .mtab td.work > div { overflow: hidden; text-overflow: ellipsis; }
 .mtab td.p-pc { width: 1%; text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; padding-left: 0; }
-.mtab td.p-bar { width: 42%; min-width: 80px; }
+/* 막대는 고정 폭. 남는 폭은 작업 이름(GPU·CPU 태그 포함)이 쓴다. */
+.mtab td.p-bar { width: 260px; min-width: 260px; }
 .mtab td.p-bar .meter { margin: 2px 0; height: 14px; border-radius: 5px; }
 .mtab td.p-eta { width: 1%; white-space: nowrap; text-align: right; }
 .mtab td.p-eta .sub { max-width: none; }
@@ -135,8 +136,11 @@ main { max-width: 1760px; margin: 0 auto; padding: 12px 18px 26px;
 .meter.cpu > i { background: var(--s7); }
 .mtab td.work .side { margin-left: 16px; color: var(--ink-2); font-weight: 400; }
 .mtab td.work .side.solo { margin-left: 0; color: inherit; font-weight: inherit; }
-.mtab td.work .ctag { font-size: 10.5px; font-weight: 600; letter-spacing: .03em; color: var(--s7);
+/* 자원 태그: 줄이 어느 자원의 일인지. 색은 그 자원의 막대 색(GPU 파랑, CPU 보라)과 같다. */
+.ctag { display: inline-block; font-size: 10.5px; font-weight: 600; letter-spacing: .03em; line-height: 1.35;
   border: 1px solid var(--ring); border-radius: 4px; padding: 0 4px; margin-right: 6px; vertical-align: 1px; }
+.ctag.gpu { color: var(--s1); }
+.ctag.cpu { color: var(--s7); }
 /* 상태 점 */
 .sdot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 9px;
   vertical-align: -1px; position: relative; background: var(--axis); box-shadow: var(--dot-ring); }
@@ -703,9 +707,12 @@ function machineTable(machines) {
                    title="${STATE_TEXT[lines[0].state]}"></span>`;
     // 작업 하나 = 표의 행 하나. 칸마다 줄을 쌓으면 막대(짧음)와 글(김)의 높이가 달라
     // 작업이 여럿일 때 이름·%·막대·종료 시각이 서로 다른 줄로 어긋난다.
-    const sideHtml = (sd, solo) => `<span class="side${solo ? " solo" : ""}" title="${esc(sd.tip)}"><span class="ctag">CPU</span>${
+    // 줄마다 앞에 자원 태그: GPU 가 여러 장이면 그 줄의 GPU 번호(GPU0–3), 한 장이면 'GPU'.
+    const tag = (kind, text) => `<span class="ctag ${kind}">${esc(text)}</span>`;
+    const gpuTag = (ids) => tag("gpu", multi && ids.length ? gpuLabel(ids) : "GPU");
+    const sideHtml = (sd, solo) => `<span class="side${solo ? " solo" : ""}" title="${esc(sd.tip)}">${tag("cpu", "CPU")}${
       esc(sd.head.what)}${sd.count > 1 ? esc(t("more", sd.count - 1)) : ""}</span>`;
-    const name = (l) => `<div title="${esc(l.tip)}">${multi && l.gpus.length ? `${esc(gpuLabel(l.gpus))} ` : ""}${
+    const name = (l) => `<div title="${esc(l.tip)}">${l.gpus.length ? gpuTag(l.gpus) : ""}${
       l.side && l.what ? `<span class="beside">${esc(l.what)}</span>` : esc(l.what)}${l.side ? sideHtml(l.side, !l.what) : ""}</div>`;
     // 진행률은 그 줄의 작업 것, CPU 요약이 붙은 줄이면 요약 맨 앞 작업 것이다.
     // 진행률이 없는 줄은 이름이 빈 %·막대·종료 칸까지 쓴다(폰에서 이름이 덜 잘린다).
@@ -754,7 +761,7 @@ function machineTable(machines) {
       const redo = aiOn && j.id ? (rs && Date.now() - rs.at < 60000
         ? `<span class="sub redo-note">${esc(rs.label)}</span>`
         : `<button class="ghost redo" data-mid="${esc(m.machine_id)}" data-job="${esc(j.id)}">${esc(t("redo"))}</button>`) : "";
-      const head = `${j.cpu ? "CPU · " : multi ? `${esc(gpuLabel(j.gpus))} · ` : ""}${esc(a ? a.title : (j.label || t("inUse")))}${
+      const head = `${j.cpu ? tag("cpu", "CPU") : gpuTag(j.gpus)}${esc(a ? a.title : (j.label || t("inUse")))}${
         j.run && num(j.run.progress_pct) ? ` · ${esc(pct(j.run.progress_pct, 0))}` : ""}`;
       if (!a) return `<div class="aibox"><h4>${head}<span class="sub">${
         j.ai && j.ai.status === "pending" ? esc(t("aiChecking")) : ""}</span>${redo}</h4></div>`;
