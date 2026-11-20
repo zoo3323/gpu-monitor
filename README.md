@@ -44,8 +44,8 @@ claude auth login
 
 <table>
   <tr>
-    <td width="70%"><img src="docs/en/light.png" alt="Light theme"></td>
-    <td><img src="docs/en/mobile.png" alt="Phone, dark theme"></td>
+    <td width="50%"><img src="docs/en/light.png" alt="Light theme"></td>
+    <td width="50%"><img src="docs/en/dark.png" alt="Dark theme"></td>
   </tr>
   <tr>
     <td colspan="2"><img src="docs/en/detail.png" alt="Machine detail: what the job is, what runs next, loss curve"></td>

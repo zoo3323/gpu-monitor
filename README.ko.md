@@ -44,8 +44,8 @@ claude auth login
 
 <table>
   <tr>
-    <td width="70%"><img src="docs/ko/light.png" alt="밝은 테마"></td>
-    <td><img src="docs/ko/mobile.png" alt="폰, 다크 테마"></td>
+    <td width="50%"><img src="docs/ko/light.png" alt="밝은 테마"></td>
+    <td width="50%"><img src="docs/ko/dark.png" alt="다크 테마"></td>
   </tr>
   <tr>
     <td colspan="2"><img src="docs/ko/detail.png" alt="머신 상세: 무슨 작업인지, 다음 작업, loss 곡선"></td>
